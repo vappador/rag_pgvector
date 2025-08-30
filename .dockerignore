@@ -1,0 +1,61 @@
+# --- Git metadata (not needed in build context) ---
+.git
+.gitignore
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+.mypy_cache/
+.pytest_cache/
+.tox/
+.cache/
+.venv/
+venv/
+.pyre/
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+
+# --- Notebooks & checkpoints ---
+.ipynb_checkpoints/
+
+# --- Editors / OS junk ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Environment & secrets (use .env.example for templates) ---
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.pfx
+
+# --- App-specific (large/local artifacts) ---
+repos/        # cloned codebases ingested at runtime
+data/
+logs/
+tmp/
+**/__snapshots__/   # common test snapshot folders
+
+# --- Node/TS (if present; keep lockfiles for reproducibility) ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Model / HF caches (if any are checked into repo) ---
+.huggingface/
+.hf_cache/

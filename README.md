@@ -321,11 +321,15 @@ Issues and PRs welcome!
 ##  Commands Reference
 
 ```bash
-# Start Postgres + Ollama
-docker compose up -d pg ollama
+#Build the app locally, so that the tag exists
+docker compose build app
 
-# Run migration once
-docker compose --profile init up migrate
+# Start Postgres + Ollama, pull models into ollama
+docker compose up -d pg ollama
+docker compose --profile init run --rm ollama-init
+
+# Run migration once to create db with tables extension etc
+docker compose --profile init run --rm migrate
 
 # Start API
 docker compose up -d app

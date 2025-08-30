@@ -1,0 +1,167 @@
+# docker-compose.yml
+
+services:
+  pg:
+    image: pgvector/pgvector:pg16
+    container_name: rag_pg
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ragpwd
+      POSTGRES_DB: ragdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d ragdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # One-shot: pull models. Run manually when needed:
+  #   docker compose --profile init run --rm ollama-init
+  ollama-init:
+    image: curlimages/curl:8.8.0
+    container_name: ollama_init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large}
+      LLM_MODEL: ${LLM_MODEL:-llama3.1:8b}
+    entrypoint: ["/bin/sh", "-lc"]
+    command: |
+      echo "Waiting for Ollama API..."; \
+      until curl -sf http://ollama:11434/api/version >/dev/null; do sleep 2; done; \
+      echo "Pulling $EMB_MODEL"; \
+      curl -s -X POST http://ollama:11434/api/pull \
+        -H 'Content-Type: application/json' \
+        -d "{\"name\":\"$EMB_MODEL\"}" >/dev/null; \
+      echo "Pulling $LLM_MODEL"; \
+      curl -s -X POST http://ollama:11434/api/pull \
+        -H 'Content-Type: application/json' \
+        -d "{\"name\":\"$LLM_MODEL\"}" >/dev/null; \
+      echo "Models ready."
+    restart: "no"
+    profiles: ["init"]
+
+  # One-shot DB migration:
+  #   docker compose --profile init run --rm migrate
+  migrate:
+    image: postgres:16
+    container_name: rag_migrate
+    depends_on:
+      pg:
+        condition: service_healthy
+    volumes:
+      - .:/workspace:ro
+    environment:
+      PGPASSWORD: ragpwd
+    command: >
+      bash -lc "psql -h pg -U rag -d ragdb -v ON_ERROR_STOP=1 -f /workspace/db/migrations/001_init.sql"
+    restart: "no"
+    profiles: ["init"]
+
+  app:
+    image: rag-pgvector-app:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_app
+    depends_on:
+      pg:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      DB_DSN: postgresql://rag:ragpwd@pg:5432/ragdb
+      OLLAMA_BASE_URL: http://ollama:11434
+      EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large}
+      EMB_DIM: "1024"
+      LLM_MODEL: ${LLM_MODEL:-llama3.1:8b}
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/workspace
+    command: sh -lc "uvicorn app.api:app --host 0.0.0.0 --port 8000 --reload"
+    restart: unless-stopped
+
+  # One-shot ingestion:
+  #   REPO_URLS="https://repo1.git,https://repo2.git" docker compose --profile ingest up --build --exit-code-from ingest ingest
+  ingest:
+    image: rag-pgvector-app:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_ingest
+    depends_on:
+      pg:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      DB_DSN: postgresql://rag:ragpwd@pg:5432/ragdb
+      OLLAMA_BASE_URL: http://ollama:11434
+      EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large}
+      EMB_DIM: "1024"
+      REPO_URLS: ${REPO_URLS:-}
+    volumes:
+      - .:/workspace
+    command: sh -lc "python /workspace/app/ingest.py"
+    profiles: ["ingest"]
+
+  # ---- Admin utilities (DANGER) ----
+  # Truncate all data (keep schema)
+  db-truncate:
+    image: postgres:16
+    container_name: rag_db_truncate
+    depends_on:
+      pg:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ragpwd
+    command: >
+      bash -lc "psql -h pg -U rag -d ragdb -v ON_ERROR_STOP=1
+      -c \"TRUNCATE rag.chunk_edges, rag.code_chunks, rag.files, rag.commits, rag.repositories
+          RESTART IDENTITY CASCADE;\""
+    restart: "no"
+    profiles: ["admin"]
+
+  # Drop & recreate rag schema (runs migration)
+  db-reset:
+    image: postgres:16
+    container_name: rag_db_reset
+    depends_on:
+      pg:
+        condition: service_healthy
+    volumes:
+      - .:/workspace:ro
+    environment:
+      PGPASSWORD: ragpwd
+    command: >
+      bash -lc "
+      psql -h pg -U rag -d ragdb -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS rag CASCADE;';
+      psql -h pg -U rag -d ragdb -v ON_ERROR_STOP=1 -f /workspace/db/migrations/001_init.sql
+      "
+    restart: "no"
+    profiles: ["admin"]
+
+volumes:
+  pgdata: {}
+  ollama: {}

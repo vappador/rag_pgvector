@@ -1,0 +1,65 @@
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- PyCharm (Community Edition) ---
+.idea/
+*.iml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+.cache/
+.tox/
+.mypy_cache/
+.pytest_cache/
+.pyre/
+.venv/
+venv/
+
+# --- Env & secrets ---
+.env
+.env.*
+
+# --- Coverage / reports ---
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+pytest.xml
+
+# --- Logs & runtime files ---
+logs/
+*.log
+tmp/
+cache/
+*.pid
+
+# --- App-specific (local artifacts) ---
+repos/         # cloned codebases ingested at runtime
+data/
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- Node/TS (if present) ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Model / HF caches ---
+.huggingface/
+.hf_cache/
+
+# --- macOS extras ---
+.AppleDouble
+.Spotlight-V100
+.Trashes
