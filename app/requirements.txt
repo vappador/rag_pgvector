@@ -4,7 +4,7 @@ psycopg2-binary==2.9.9
 GitPython==3.1.43
 tqdm==4.66.5
 numpy==1.26.4
-tree_sitter==0.22.3
+tree_sitter==0.20.2
 tree_sitter_languages==1.10.2
 langgraph==0.2.35
 ollama>=0.2.0

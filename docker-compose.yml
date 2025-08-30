@@ -90,8 +90,11 @@ services:
         condition: service_healthy
     environment:
       DB_DSN: postgresql://rag:ragpwd@pg:5432/ragdb
+      # Point the app at the Ollama HTTP API (not the unix socket)
+      OLLAMA_HOST: http://ollama:11434
       OLLAMA_BASE_URL: http://ollama:11434
-      EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large}
+      # Use explicit tags to avoid mismatches with /api/tags responses
+      EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large:latest}
       EMB_DIM: "1024"
       LLM_MODEL: ${LLM_MODEL:-llama3.1:8b}
       PYTHONUNBUFFERED: "1"
@@ -99,7 +102,8 @@ services:
       - "8000:8000"
     volumes:
       - .:/workspace
-    command: sh -lc "uvicorn app.api:app --host 0.0.0.0 --port 8000 --reload"
+    command: >
+      sh -lc 'uvicorn app.api:app --host 0.0.0.0 --port 8000 --reload'
     restart: unless-stopped
 
   # One-shot ingestion:
