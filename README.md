@@ -29,17 +29,24 @@ Local, production-ready Retrieval-Augmented Generation (RAG) for **code reposito
 rag-pgvector/
 ├─ Dockerfile
 ├─ docker-compose.yml
+├─ .dockerignore
 ├─ .env.example
+├─ .gitignore
+├─ Makefile
+├─ QUICKSTART.MD
 ├─ db/
-│  └─ migrations/001_init.sql
-├─ app/
-│  ├─ requirements.txt
-│  ├─ db.py
-│  ├─ ingest.py
-│  ├─ api.py              # unified API (search, graph, ask endpoints)
-│  ├─ agent_graph.py      # LangGraph demo agent
-│  └─ strands_agent.py    # Strands demo agent
-└─ Makefile
+│  └─ migrations/
+│      └─ 001_init.sql
+└─ app/
+   ├─ requirements.txt
+   ├─ db.py                  # Postgres connection & helpers
+   ├─ ingest.py              # repo ingest pipeline (clone → parse → embed → store)
+   ├─ api.py                 # FastAPI app: search, graph, ask; wires modules below
+   ├─ search.py              # hybrid retrieval (vector + BM25 + symbol boosts)
+   ├─ rerankers.py           # candidate rerankers: CrossEncoder, LLM-based
+   ├─ answering.py           # provenance-first synthesis + stitched context
+   ├─ agent_graph.py         # LangGraph CLI demo agent
+   └─ strands_agent.py       # Strands API demo agent with rate limits & observability
 ```
 
 ---
@@ -49,34 +56,36 @@ rag-pgvector/
 ```mermaid
 flowchart LR
   subgraph Git
-    A[Repo A]:::git --> C
-    B[Repo B]:::git --> C
+    GA[Repo A] --> IN
+    GB[Repo B] --> IN
   end
 
   subgraph Ingestion
-    C[Clone / Pull] --> D["Tree-sitter AST chunking<br/>(symbols, doc, imports, calls)"]
-    D --> E["Ollama Embeddings<br/>(mxbai-embed-large 1024d)"]
-    E --> F[(Postgres + pgvector)]
+    IN[Clone or Pull] --> TS[Tree-sitter chunking]
+    TS --> EM[Embeddings with mxbai-embed-large 1024d]
+    EM --> DB[(Postgres + pgvector)]
   end
 
-  subgraph Retrieval API
-    G[/HTTP GET /search/] --> H["Ollama Embed Query"]
-    H --> F
-    F --> I["Hybrid Rank<br/>(vec + BM25 + symbol boost)"]
-    I --> J[Context Stitch]
+  subgraph Retrieval Pipeline
+    QE[Embed query via Ollama] --> DB
+    DB --> SR[search.py hybrid rank]
+    SR --> RR[rerankers.py rerank]
+    RR --> AN[answering.py stitch + provenance]
+  end
+
+  subgraph API
+    SR --> AP1[/GET /search/]
+    AN --> AP2[/POST /ask/langgraph/]
+    AN --> AP3[/POST /ask/strands/]
+    DB --> AP4[/GET /graph/relations/]
+    DB --> AP5[/GET /graph/impact/]
   end
 
   subgraph Agents
-    K[LangGraph Agent] -->|calls| G
-    J --> K
-    K --> L["Ollama Chat (llama3.1:8b)"]
-
-    M[Strands Agent] -->|Tool: retrieve_context| F
-    F --> M
-    M --> N["Ollama Chat (llama3.1:8b)"]
+    LG[LangGraph agent] --> AP2
+    ST[Strands agent] --> AP3
+    ST --> OP[Observability and rate limits]
   end
-
-classDef git fill:#f0f8ff,stroke:#7aa,stroke-width:1px;
 ```
 
 ---
@@ -86,21 +95,22 @@ classDef git fill:#f0f8ff,stroke:#7aa,stroke-width:1px;
 ```mermaid
 flowchart TB
   subgraph LangGraph
-    LG1([StateGraph])
-    LG2[retrieve node]
-    LG3[generate_answer node]
-    LG1 --> LG2 --> LG3
-    LG3 --> LG4[(Ollama Chat)]
-    LG2 --> LG5[(Postgres + pgvector)]
+    L1[StateGraph]
+    L2[retrieve node uses search.py]
+    L3[rerank node uses rerankers.py]
+    L4[answer node uses answering.py]
+    L1 --> L2 --> L3 --> L4
+    L4 --> L5[(Ollama chat)]
   end
 
   subgraph Strands
-    ST1([Agent Loop])
-    ST2{{Tool: retrieve_context}}
-    ST1 -->|decides tool use| ST2
-    ST2 --> ST5[(Postgres + pgvector)]
-    ST1 --> ST4[(Ollama Chat)]
-    ST1 --> ST6[(Observability + Rate Limits)]
+    S1[Agent loop]
+    S2{{Tool retrieve_context uses search.py}}
+    S3{{Tool rerank uses rerankers.py}}
+    S4{{Tool synthesize uses answering.py}}
+    S1 --> S2 --> S3 --> S4
+    S1 --> S6[(Observability and rate limits)]
+    S1 --> S5[(Ollama chat)]
   end
 ```
 
@@ -153,6 +163,27 @@ OLLAMA_BASE_URL=http://ollama:11434
 
 ---
 
+## Docker Compose
+
+The stack is defined in `docker-compose.yml` with additional one-shot services and health checks.
+
+**Services**
+- `pg` — Postgres 16 with pgvector; healthcheck via `pg_isready`; volume `pgdata` (persistent).  
+- `ollama` — Ollama runtime on port `11434`; healthcheck `ollama list`; volume `ollama`.  
+- `app` — FastAPI on port `8000`; depends on `pg`, `ollama`; command `uvicorn api:app --host 0.0.0.0 --port 8000`.  
+- `migrate` — one-shot migration job that applies `db/migrations/*.sql` (profile: `init`).  
+- `ingest` — one-shot ingestion job; uses `REPO_URLS` env (profile: `ingest`).  
+
+**Volumes**
+- `pgdata` → `/var/lib/postgresql/data`  
+- `ollama` → `/root/.ollama`  
+
+**Healthchecks**
+- `pg` waits for DB readiness before app connects.  
+- `ollama` validates the runtime can respond before app starts.  
+
+---
+
 ## Quickstart
 
 ### 1) Bring up core services
@@ -173,7 +204,8 @@ docker exec -it ollama ollama pull llama3.1:8b
 ### 3) Ingest repositories
 
 ```bash
-REPO_URLS="https://github.com/expressjs/express.git,https://github.com/spring-projects/spring-petclinic.git" docker compose --profile ingest up --exit-code-from ingest ingest
+REPO_URLS="https://github.com/expressjs/express.git,https://github.com/spring-projects/spring-petclinic.git" \
+  docker compose --profile ingest up --exit-code-from ingest ingest
 ```
 
 ### 4) Try the retrieval API
@@ -206,21 +238,17 @@ curl -X POST http://localhost:8000/ask/langgraph   -H "Content-Type: application
 
 ## 🔌 API Reference
 
-### API Endpoints Table
+### Endpoints
 
-| Method | Path              | Purpose                                  |
-|--------|------------------|------------------------------------------|
-| GET    | `/search`        | Hybrid retrieval (vector + lexical)      |
-| POST   | `/ask/strands`   | Ask a question via **Strands Agent**     |
-| POST   | `/ask/langgraph` | Ask a question via **LangGraph Agent**   |
-| GET    | `/graph/relations` | Show dependency relations for a file   |
-| GET    | `/graph/impact`    | Show impact analysis of a file change  |
+| Method | Path                | Purpose                                        |
+|-------:|---------------------|------------------------------------------------|
+| GET    | `/search`           | Hybrid retrieval (vector + lexical)           |
+| POST   | `/ask/strands`      | Ask a question via **Strands Agent**          |
+| POST   | `/ask/langgraph`    | Ask a question via **LangGraph Agent**        |
+| GET    | `/graph/relations`  | Show dependency relations for a file          |
+| GET    | `/graph/impact`     | Show impact analysis of a file change         |
 
----
-
-### `/search` (retrieval only)
-
-**Example**
+#### `/search` (retrieval only)
 
 ```bash
 curl "http://localhost:8000/search?q=jwt%20verification&language=java"
@@ -248,18 +276,12 @@ curl "http://localhost:8000/search?q=jwt%20verification&language=java"
 }
 ```
 
----
+#### `/ask/strands`
 
-### `/ask/strands`
-
-**POST body**
-```json
-{ "question": "Where is JWT verification implemented?" }
-```
-
-**curl**
 ```bash
-curl -X POST http://localhost:8000/ask/strands   -H "Content-Type: application/json"   -d '{"question":"Where is JWT verification implemented?"}'
+curl -X POST http://localhost:8000/ask/strands \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Where is JWT verification implemented?"}'
 ```
 
 **Response (example)**
@@ -270,18 +292,12 @@ curl -X POST http://localhost:8000/ask/strands   -H "Content-Type: application/j
 }
 ```
 
----
+#### `/ask/langgraph`
 
-### `/ask/langgraph`
-
-**POST body**
-```json
-{ "question": "Where is JWT verification implemented?" }
-```
-
-**curl**
 ```bash
-curl -X POST http://localhost:8000/ask/langgraph   -H "Content-Type: application/json"   -d '{"question":"Where is JWT verification implemented?"}'
+curl -X POST http://localhost:8000/ask/langgraph \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Where is JWT verification implemented?"}'
 ```
 
 **Response (example)**
@@ -292,36 +308,17 @@ curl -X POST http://localhost:8000/ask/langgraph   -H "Content-Type: application
 }
 ```
 
----
+#### `/graph/relations`
 
-### `/graph/relations`
-
-Explores dependency edges for a given file.
-
-Example:
 ```bash
 curl "http://localhost:8000/graph/relations?repo=spring-petclinic&file=Person.java&direction=both&depth=2"
 ```
 
----
+#### `/graph/impact`
 
-### `/graph/impact`
-
-Shows files impacted by a file change.
-
-Example:
 ```bash
 curl "http://localhost:8000/graph/impact?repo=spring-petclinic&file=Person.java&depth=2"
 ```
-
----
-
-## 🧠 Strands Features
-
-- **Rate limiting** (RPM, TPM, concurrency) via `.env`  
-- **Observability** via `strands.observability.get_metrics()`  
-- **Tools**: retrieval is registered as a Strands tool (`retrieve_context`)  
-- **System prompt** ensures provenance is cited inline  
 
 ---
 
@@ -331,26 +328,27 @@ curl "http://localhost:8000/graph/impact?repo=spring-petclinic&file=Person.java&
 - `rag.repositories` ⇒ one per repo  
 - `rag.commits` ⇒ commit metadata  
 - `rag.files` ⇒ file metadata (language, size, test flag)  
-- `rag.code_chunks` ⇒ **the core**: function/class or windowed chunks  
-  - content, `embedding vector(1024)`, `content_tsv` (lexical), `symbol_name`, `symbol_kind`, `symbol_signature`, `doc_comment`, `imports JSONB`, `calls JSONB`, `committed_at`, `valid_from`, `valid_to`  
+- `rag.code_chunks` ⇒ function/class or windowed chunks  
+  - columns: `content`, `embedding vector(1024)`, `content_tsv`, `symbol_name`, `symbol_kind`, `symbol_signature`, `doc_comment`, `imports JSONB`, `calls JSONB`, `committed_at`, `valid_from`, `valid_to`  
 - `rag.chunk_edges` ⇒ optional relations (`calls`, `imports`, `implements`, `tests`)  
 - `rag.v_chunk_search` ⇒ view joining chunks ↔ files ↔ repos  
 
 **Indexes**
 - `GIN(content_tsv)` for lexical/BM25  
-- `IVFFLAT` on `embedding` (cosine) for ANN  
-- btree on symbol fields and GIN on JSONB `imports`/`calls`  
+- `IVFFLAT` on `embedding` (cosine) for ANN (or HNSW if supported)  
+- B-tree on symbol fields and GIN on JSONB `imports`/`calls`  
 
 ---
 
-## Retrieval Strategy (Hybrid)
+## Retrieval Strategy
 
-- **Vector**: cosine similarity on pgvector (query embedded via Ollama)  
-- **Lexical**: `ts_rank_cd` over a `simple` + `unaccent` tsvector of code text  
-- **Symbol boost**: direct hits on `symbol_name` or `symbol_signature`  
-- **Ordering**: `hybrid_score = w_vec*vec + w_lex*lex + w_sym*sym_boost`  
-
-Tuning knobs are exposed via query params (`w_vec`, `w_lex`, `w_sym`, `top_k`).
+- **Vector similarity** with pgvector (cosine).  
+- **Lexical search** with BM25 on code text.  
+- **Symbol/name boost** for exact matches.  
+- **Reranking** via `rerankers.py` (CrossEncoder or LLM judge).  
+- **Synthesis** via `answering.py` with stitched context and inline provenance.  
+- **Ordering**: `hybrid_score = w_vec*vec + w_lex*lex + w_sym*sym_boost`.  
+- Tuning knobs: `top_k`, `w_vec`, `w_lex`, `w_sym`, plus filters like `language`, `repo`, `path_prefix`.
 
 ---
 
@@ -386,7 +384,7 @@ If you want to preserve data, you must recompute embeddings to the new dimension
 - Use **read-only DB roles** for the API  
 - Enable **SSL** for Postgres (or run inside a trusted network)  
 - Add **webhook/cron ingestion**, **idempotent staging**, **soft-deletes**, and **partitioning** for very large repos  
-- Consider **HNSW** indexes if your pgvector build supports it (great online insert performance)  
+- Prefer **HNSW** indexes if your pgvector build supports it (strong for online inserts)  
 
 ---
 
@@ -403,15 +401,17 @@ If you want to preserve data, you must recompute embeddings to the new dimension
   docker exec -it ollama ollama pull mxbai-embed-large
   ```
 
+- **Reranker model missing / slow**  
+  Disable reranking temporarily or reduce `top_k`; confirm GPU/CPU availability if using a CE model.
+
+- **No stitched context**  
+  Ensure `/search` includes `stitched_context`, and `answering.py` is used by `api.py`.
+
 - **Slow queries after big ingests**  
-  Re-ANALYZE:
   ```sql
   ANALYZE rag.code_chunks;
   ```
   Increase IVFFLAT `lists` (e.g., 100 → 200) and reindex.
-
-- **No results for symbol queries**  
-  Try including exact method/class names; symbol boosts rely on `symbol_name`/`symbol_signature`.
 
 ---
 
