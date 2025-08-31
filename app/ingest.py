@@ -6,12 +6,18 @@ What this version does:
 - Early chunking (AST-first; windowed fallback) to avoid server-side embedding truncation.
 - Rich logs, including when fallback goes into windowed mode.
 - Embeddings via Ollama with explicit host (OLLAMA_HOST/OLLAMA_BASE_URL).
-- **Edges generation**: intra-file call edges after chunk upserts.
-  - Creates table chunk_edges if it does not exist.
-  - Logs edge counts per file and totals.
-  - Flag: --build-edges / --no-build-edges (default: on). Env: BUILD_EDGES=1/0.
+- **Edges generation**:
+  - Intra-file call edges after chunk upserts.
+  - Cross-file call edges via a DB stored procedure (build_cross_file_call_edges).
+- New metadata & indices to improve cross-file resolution:
+  - code_files.module, code_chunks.symbol_simple
+  - file_imports (normalized import surface)
+  - code_symbols (export/definition surface)
+- Flags:
+  - --build-edges / --no-build-edges (default: on). Env: BUILD_EDGES=1/0.
+  - --embed to compute embeddings.
 
-NOTE: Cross-file edges are not generated here (see comment at bottom to extend).
+NOTE: Cross-file edge logic is materialized in SQL and invoked once at end of run.
 """
 
 from __future__ import annotations
@@ -143,7 +149,7 @@ def git_changed_files(repo_dir: Path, base_ref: str) -> List[Path]:
 class Chunk:
     language: str
     symbol_kind: str          # class|method|function|module|module_part
-    symbol_name: str          # e.g., Person#updateEmail or function name
+    symbol_name: str          # e.g., Person#updateEmail or function name (may be FQN for Java)
     start_line: int
     end_line: int
     content: str
@@ -162,6 +168,43 @@ def _walk(node) -> Iterable:
         for i in reversed(range(n.child_count)):
             stack.append(n.child(i))
 
+# -------- Enhanced call extraction helpers --------
+
+def _callee_name_from_call_expr_ts(src: bytes, node) -> Optional[str]:
+    callee = node.child_by_field_name("function") or node.child_by_field_name("callee")
+    if callee is None:
+        return None
+    if callee.type == "member_expression":
+        obj = callee.child_by_field_name("object")
+        prop = callee.child_by_field_name("property")
+        if obj is not None and prop is not None:
+            return _node_text(src, obj) + "." + _node_text(src, prop)
+    return _node_text(src, callee)
+
+def _py_call_name(src: bytes, call_node) -> Optional[str]:
+    fn = call_node.child_by_field_name("function")
+    if fn is None:
+        return None
+    if fn.type == "attribute":
+        parts = []
+        cur = fn
+        # Walk left along attribute chain to collect "a.b.c"
+        while cur is not None:
+            if cur.type == "attribute":
+                attr = cur.child_by_field_name("attribute")
+                obj = cur.child_by_field_name("object")
+                if attr is not None:
+                    parts.append(_node_text(src, attr))
+                cur = obj
+            else:
+                parts.append(_node_text(src, cur))
+                break
+        parts = list(reversed(parts))
+        return ".".join(parts)
+    return _node_text(src, fn)
+
+# ------------------------------ Language chunkers ------------------------------
+
 def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
     """
     AST-aware chunking per language. Gracefully returns [] if parser missing.
@@ -177,6 +220,13 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
     chunks: List[Chunk] = []
 
     if lang == "java":
+        # package
+        java_package = None
+        for node in _walk(root):
+            if node.type == "package_declaration":
+                java_package = _node_text(source, node).strip().replace("package", "").rstrip(";").strip()
+                break
+
         # imports
         imports = set()
         for n in _walk(root):
@@ -185,7 +235,7 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                 if text.startswith("import"):
                     imports.add(text.replace("import", "", 1).strip())
 
-        # classes -> methods
+        # classes -> methods/constructors
         for class_node in _walk(root):
             if class_node.type in ("class_declaration", "interface_declaration"):
                 class_name = None
@@ -207,28 +257,54 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                             continue
 
                         calls = set()
+
+                        def add_call(name: Optional[str]):
+                            if not name:
+                                return
+                            name = name.strip()
+                            if not name:
+                                return
+                            calls.add(name)
+                            if "." in name:
+                                calls.add(name.split(".")[-1])
+
                         for ch in _walk(n):
-                            if ch.type == "method_invocation":
-                                for idn in _walk(ch):
-                                    if idn.type == "identifier":
-                                        calls.add(_node_text(source, idn))
-                                        break
+                            t = ch.type
+                            if t == "method_invocation":
+                                sel = ch.child_by_field_name("object")
+                                m = ch.child_by_field_name("name")
+                                if sel is not None and m is not None:
+                                    add_call(_node_text(source, sel) + "." + _node_text(source, m))
+                                elif m is not None:
+                                    add_call(_node_text(source, m))
+                            if t == "field_access":
+                                fld = ch.child_by_field_name("field")
+                                if fld is not None:
+                                    add_call(_node_text(source, fld))
+                            if t == "object_creation_expression":
+                                typ = ch.child_by_field_name("type")
+                                if typ is not None:
+                                    add_call(_node_text(source, typ))  # constructor Type
 
                         start_line = n.start_point[0] + 1
                         end_line = n.end_point[0] + 1
                         content = _node_text(source, n)
-                        symbol = f"{class_name}#{meth_name}"
+                        # prefer FQN when package is known
+                        fq_sym = f"{java_package}.{class_name}#{meth_name}" if java_package else f"{class_name}#{meth_name}"
+                        ast_meta = {"class": class_name, "method": meth_name}
+                        if java_package:
+                            ast_meta["package"] = java_package
                         chunks.append(
                             Chunk(
                                 language=lang,
                                 symbol_kind="method",
-                                symbol_name=symbol,
+                                symbol_name=fq_sym,
                                 start_line=start_line,
                                 end_line=end_line,
                                 content=content,
                                 imports=sorted(imports),
                                 calls=sorted(calls),
-                                ast={"class": class_name, "method": meth_name},
+                                ast=ast_meta,
                             )
                         )
 
@@ -237,6 +313,14 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
         for n in _walk(root):
             if n.type == "import_declaration":
                 imports.add(_node_text(source, n).strip())
+
+        # naive export capture
+        exports = set()
+        for n in _walk(root):
+            if n.type in ("export_statement", "export_clause", "export_specifier", "lexical_declaration"):
+                text = _node_text(source, n)
+                if "export" in text:
+                    exports.add(text)
 
         # function declarations
         for n in _walk(root):
@@ -250,10 +334,12 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                     calls = set()
                     for ch in _walk(n):
                         if ch.type == "call_expression":
-                            for idn in _walk(ch):
-                                if idn.type == "identifier":
-                                    calls.add(_node_text(source, idn))
-                                    break
+                            nm = _callee_name_from_call_expr_ts(source, ch)
+                            if nm:
+                                calls.add(nm)
+                                if "." in nm:
+                                    calls.add(nm.split(".")[-1])
+                    ast_meta = {"function": name, "exports": sorted(list(exports))}
                     chunks.append(
                         Chunk(
                             language=lang,
@@ -264,11 +350,11 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                             content=_node_text(source, n),
                             imports=sorted(imports),
                             calls=sorted(calls),
-                            ast={"function": name},
+                            ast=ast_meta,
                         )
                     )
 
-        # class methods
+        # class + methods
         for n in _walk(root):
             if n.type == "class_declaration":
                 class_name = None
@@ -290,10 +376,12 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                         calls = set()
                         for ch in _walk(m):
                             if ch.type == "call_expression":
-                                for idn in _walk(ch):
-                                    if idn.type == "identifier":
-                                        calls.add(_node_text(source, idn))
-                                        break
+                                nm = _callee_name_from_call_expr_ts(source, ch)
+                                if nm:
+                                    calls.add(nm)
+                                    if "." in nm:
+                                        calls.add(nm.split(".")[-1])
+                        ast_meta = {"class": class_name, "method": meth_name, "exports": sorted(list(exports))}
                         chunks.append(
                             Chunk(
                                 language=lang,
@@ -304,7 +392,7 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                                 content=_node_text(source, m),
                                 imports=sorted(imports),
                                 calls=sorted(calls),
-                                ast={"class": class_name, "method": meth_name},
+                                ast=ast_meta,
                             )
                         )
 
@@ -326,11 +414,11 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                     calls = set()
                     for ch in _walk(n):
                         if ch.type == "call":
-                            fn = ch.child_by_field_name("function")
-                            if fn is not None:
-                                target = _node_text(source, fn)
-                                if target:
-                                    calls.add(target.split("(")[0].strip())
+                            nm = _py_call_name(source, ch)
+                            if nm:
+                                calls.add(nm)
+                                if "." in nm:
+                                    calls.add(nm.split(".")[-1])
                     chunks.append(
                         Chunk(
                             language=lang,
@@ -367,11 +455,11 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                         calls = set()
                         for ch in _walk(m):
                             if ch.type == "call":
-                                fn = ch.child_by_field_name("function")
-                                if fn is not None:
-                                    target = _node_text(source, fn)
-                                    if target:
-                                        calls.add(target.split("(")[0].strip())
+                                nm = _py_call_name(source, ch)
+                                if nm:
+                                    calls.add(nm)
+                                    if "." in nm:
+                                        calls.add(nm.split(".")[-1])
                         chunks.append(
                             Chunk(
                                 language=lang,
@@ -479,7 +567,7 @@ def make_chunks(
         verbose_filename=str(path),
     )
 
-# ------------------------------ DB upserts ------------------------------------
+# ------------------------------ DB helpers ------------------------------------
 
 def get_or_create_repository(cur, name: str, url: str) -> int:
     cur.execute(
@@ -508,27 +596,25 @@ def upsert_code_file(
     language: Optional[str],
     size_bytes: int,
     checksum: Optional[str],
+    module: Optional[str],
 ) -> int:
     cur.execute(
         """
-        INSERT INTO code_files (repository_id, path, language, size_bytes, checksum)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO code_files (repository_id, path, language, size_bytes, checksum, module)
+        VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (repository_id, path) DO UPDATE
           SET language = EXCLUDED.language,
               size_bytes = EXCLUDED.size_bytes,
               checksum = EXCLUDED.checksum,
+              module = EXCLUDED.module,
               updated_at = now()
         RETURNING id
         """,
-        (repository_id, rel_path, language, size_bytes, checksum),
+        (repository_id, rel_path, language, size_bytes, checksum, module),
     )
     return cur.fetchone()[0]
 
 def ensure_chunk_edges_table(cur) -> None:
-    """
-    Creates chunk_edges if missing with minimal schema:
-    (src_chunk_id, dst_chunk_id, edge_type, weight, created_at).
-    """
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS chunk_edges (
@@ -541,8 +627,6 @@ def ensure_chunk_edges_table(cur) -> None:
         );
         """
     )
-    # Helpful index for uniqueness (if you add a unique constraint yourself,
-    # ON CONFLICT DO NOTHING can be used; here we do a WHERE NOT EXISTS insert).
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_chunk_edges_src_dst_type
@@ -564,9 +648,6 @@ def insert_edge_if_absent(cur, src_id: int, dst_id: int, edge_type: str, weight:
     )
 
 def simple_symbol_name(symbol_name: str) -> str:
-    """
-    For 'Class#method' -> 'method'; for 'foo' -> 'foo'.
-    """
     if "#" in symbol_name:
         return symbol_name.split("#", 1)[1] or symbol_name
     return symbol_name
@@ -579,10 +660,6 @@ def upsert_code_chunk(
     embed_model: Optional[str],
     embed_max_chars: int,
 ) -> int:
-    """
-    Upsert a chunk by (file_id, start_line, end_line), compute content_hash,
-    optionally compute embedding via Ollama.
-    """
     content_hash = sha256_text(
         f"{c.symbol_kind}|{c.symbol_name}|{c.start_line}|{c.end_line}|{c.content}"
     )
@@ -612,21 +689,27 @@ def upsert_code_chunk(
         except Exception as e:
             log.warning(f"[embed-warn] {c.symbol_name}: {e}")
 
+    symbol_simple = simple_symbol_name(c.symbol_name)
+
     cur.execute(
         """
         INSERT INTO code_chunks
-          (file_id, start_line, end_line, content, language,
-           symbol_kind, symbol_name, imports, calls, ast,
+          (file_id, start_line, end_line, content, content_tsv,
+           language, symbol_kind, symbol_name, symbol_simple,
+           imports, calls, ast,
            embedding, embedding_model, embedding_hash, content_hash)
         VALUES
-          (%s, %s, %s, %s, %s,
-           %s, %s, %s, %s, %s,
+          (%s, %s, %s, %s, to_tsvector('english', %s),
+           %s, %s, %s, %s,
+           %s, %s, %s,
            %s, %s, %s, %s)
         ON CONFLICT (file_id, start_line, end_line) DO UPDATE SET
            content = EXCLUDED.content,
+           content_tsv = EXCLUDED.content_tsv,
            language = EXCLUDED.language,
            symbol_kind = EXCLUDED.symbol_kind,
            symbol_name = EXCLUDED.symbol_name,
+           symbol_simple = EXCLUDED.symbol_simple,
            imports = EXCLUDED.imports,
            calls = EXCLUDED.calls,
            ast = EXCLUDED.ast,
@@ -642,9 +725,11 @@ def upsert_code_chunk(
             c.start_line,
             c.end_line,
             c.content,
+            c.content,
             c.language,
             c.symbol_kind,
             c.symbol_name,
+            symbol_simple,
             c.imports,
             c.calls,
             psycopg2.extras.Json(c.ast),
@@ -655,6 +740,166 @@ def upsert_code_chunk(
         ),
     )
     return cur.fetchone()[0]
+
+# ------------------------------ New: imports & symbols -------------------------
+
+def parse_import(raw: str, lang: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (module, symbol) best-effort.
+    - Java: "com.acme.pkg.ClassName" -> ("com.acme.pkg", "ClassName")
+    - TS/JS: "import {foo as bar} from 'lib/x'" -> ("lib/x", "foo"); "import x from 'lib/x'" -> ("lib/x", None or 'default')
+    - Python: "from pkg.mod import fn" -> ("pkg.mod", "fn") ; "import pkg.mod as m" -> ("pkg.mod", None)
+    """
+    if not raw:
+        return (None, None)
+    try:
+        text = raw.strip()
+        if lang == "java":
+            t = text.replace("import", "").replace("static", "").strip().rstrip(";")
+            if "." in t:
+                mod, sym = t.rsplit(".", 1)
+                return (mod.strip(), sym.strip())
+            else:
+                return (t, None)
+
+        if lang in ("typescript", "javascript"):
+            # extremely light-weight parse
+            # examples:
+            #   import X from 'lib/x'
+            #   import {foo as bar, baz} from "lib/x"
+            #   import * as ns from 'lib/x'
+            mod = None
+            sym = None
+            if " from " in text:
+                after_from = text.split(" from ", 1)[1].strip()
+                quote = "'" if "'" in after_from else '"'
+                if quote in after_from:
+                    mod = after_from.split(quote)[1]
+            if "import {" in text:
+                inside = text.split("import {",1)[1].split("}",1)[0]
+                first = inside.split(",")[0].strip()
+                if " as " in first:
+                    first = first.split(" as ",1)[0].strip()
+                sym = first or None
+            elif "import * as" in text:
+                sym = None
+            elif text.startswith("import "):
+                # default import
+                rest = text[len("import "):].strip()
+                if rest and not rest.startswith("{") and not rest.startswith("*") and " from " in rest:
+                    default_sym = rest.split(" from ",1)[0].strip()
+                    if default_sym and default_sym not in ("", ";"):
+                        sym = None  # treat default as None
+            return (mod, sym)
+
+        if lang == "python":
+            if text.startswith("from "):
+                # from pkg.mod import fn, g
+                parts = text.split()
+                if len(parts) >= 4 and parts[0] == "from" and parts[2] == "import":
+                    mod = parts[1].strip()
+                    sym = parts[3].split(",")[0].strip()
+                    return (mod, sym)
+            if text.startswith("import "):
+                # import pkg.mod as m
+                mod = text.split()[1].split(",")[0].strip()
+                return (mod, None)
+    except Exception:
+        pass
+    return (None, None)
+
+def upsert_file_imports(cur, file_id: int, imports: List[str], lang: Optional[str]) -> None:
+    for raw in imports or []:
+        module, symbol = parse_import(raw, lang)
+        cur.execute(
+            """
+            INSERT INTO file_imports(file_id, raw_import, module, symbol)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (file_id, raw, module, symbol),
+        )
+
+def _is_exported(c: Chunk) -> bool:
+    try:
+        ex = c.ast.get("exports")
+        if isinstance(ex, list):
+            # naive: if any export text mentions our simple name, mark exported
+            sname = simple_symbol_name(c.symbol_name)
+            return any(sname in e for e in ex)
+    except Exception:
+        pass
+    # Python top-level function treated as exported-ish;
+    # Java methods aren’t usually exported; return False by default.
+    return c.symbol_kind == "function" and c.language == "python"
+
+def upsert_code_symbol(cur, repo_id: int, file_id: int, chunk_id: int, c: Chunk, module: Optional[str]) -> None:
+    class_name = None
+    if isinstance(c.ast, dict):
+        class_name = c.ast.get("class")
+    symbol_full = c.symbol_name
+    cur.execute(
+        """
+        INSERT INTO code_symbols(repository_id, file_id, chunk_id, language, module, class_name, symbol_simple, symbol_full, exported)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (chunk_id) DO UPDATE SET
+           language = EXCLUDED.language,
+           module = EXCLUDED.module,
+           class_name = EXCLUDED.class_name,
+           symbol_simple = EXCLUDED.symbol_simple,
+           symbol_full = EXCLUDED.symbol_full,
+           exported = EXCLUDED.exported
+        """,
+        (
+            repo_id, file_id, chunk_id, c.language, module, class_name,
+            simple_symbol_name(c.symbol_name), symbol_full, _is_exported(c)
+        )
+    )
+
+# ------------------------------ Module derivation ------------------------------
+
+def derive_module(repo_root: Optional[Path], file_path: Path, lang: Optional[str], java_package: Optional[str]) -> Optional[str]:
+    try:
+        if lang == "java":
+            if java_package:
+                return java_package
+            # fallback: derive from path segments after 'java' or 'src'
+            p = str(file_path).replace("\\", "/")
+            if "/java/" in p:
+                after = p.split("/java/",1)[1]
+                if "/" in after:
+                    parts = after.split("/")
+                    # drop filename
+                    return ".".join(parts[:-1])
+            if repo_root and file_path.is_relative_to(repo_root):
+                rel = file_path.relative_to(repo_root)
+                parts = list(rel.parts)
+                if parts:
+                    return ".".join(parts[:-1])
+            return None
+        if lang == "python":
+            # repo-relative dotted path without .py
+            if repo_root and file_path.is_relative_to(repo_root):
+                rel = file_path.relative_to(repo_root)
+                parts = list(rel.parts)
+                if parts and parts[-1].endswith(".py"):
+                    parts[-1] = parts[-1][:-3]
+                return ".".join(parts[:-1]) if len(parts) > 1 else parts[0].replace(".py","")
+            return file_path.stem
+        if lang in ("typescript","javascript"):
+            # module path without extension, repo-relative
+            if repo_root and file_path.is_relative_to(repo_root):
+                rel = file_path.relative_to(repo_root)
+                p = str(rel)
+            else:
+                p = str(file_path)
+            for ext in (".ts",".tsx",".js",".jsx"):
+                if p.endswith(ext):
+                    p = p[: -len(ext)]
+                    break
+            return p.replace("\\","/")
+        return None
+    except Exception:
+        return None
 
 # ------------------------------ Main ingest -----------------------------------
 
@@ -734,7 +979,7 @@ def main():
     # Edges
     build_edges_default = os.environ.get("BUILD_EDGES", "1").strip() not in ("0", "false", "False", "")
     ap.add_argument("--build-edges", dest="build_edges", action="store_true", default=build_edges_default,
-                    help="Build intra-file call edges (default: on)")
+                    help="Build intra-file call edges (default: on) and run cross-file materializer")
     ap.add_argument("--no-build-edges", dest="build_edges", action="store_false",
                     help="Disable edges building")
 
@@ -799,10 +1044,15 @@ def main():
             except Exception:
                 size_bytes = 0
 
+            file_text_for_checksum = None
             try:
-                checksum = sha256_text(fp.read_text(encoding="utf-8", errors="ignore"))
+                file_text_for_checksum = fp.read_text(encoding="utf-8", errors="ignore")
+                checksum = sha256_text(file_text_for_checksum)
             except Exception:
                 checksum = None
+
+            # derive module (for Java we may refine after chunks)
+            module_guess = derive_module(root, fp, lang, None)
 
             file_id = upsert_code_file(
                 cur,
@@ -811,6 +1061,7 @@ def main():
                 language=lang,
                 size_bytes=size_bytes,
                 checksum=checksum,
+                module=module_guess,
             )
 
             # Chunk
@@ -829,11 +1080,26 @@ def main():
                 log.debug(f"[skip] {rel_path}: no chunks (unknown language or empty file)")
                 continue
 
+            # If Java chunks exposed a package, update file module with it
+            if lang == "java":
+                java_pkg = None
+                for c in chunks:
+                    if isinstance(c.ast, dict) and c.ast.get("package"):
+                        java_pkg = c.ast.get("package")
+                        break
+                if java_pkg and java_pkg != module_guess:
+                    cur.execute("UPDATE code_files SET module = %s, updated_at = now() WHERE id = %s", (java_pkg, file_id))
+                    module_guess = java_pkg
+
             # Upsert chunks and collect info for edge building
-            # Map: simple_name -> list of (chunk_id, full_symbol, symbol_kind)
             name_to_chunks: Dict[str, List[Tuple[int, str, str]]] = {}
-            # Keep source chunk info with its calls list
             chunk_ids_and_calls: List[Tuple[int, List[str], str]] = []
+
+            # Collect per-file imports from first chunk that has them; for fallback we may parse from file_text_for_checksum if needed
+            file_level_imports = set()
+            for c in chunks:
+                for imp in c.imports or []:
+                    file_level_imports.add(imp)
 
             for c in chunks:
                 cid = upsert_code_chunk(
@@ -848,6 +1114,12 @@ def main():
                 name_to_chunks.setdefault(sname, []).append((cid, c.symbol_name, c.symbol_kind))
                 chunk_ids_and_calls.append((cid, c.calls or [], c.symbol_name))
                 total_chunks += 1
+
+                # symbol surface
+                upsert_code_symbol(cur, repo_id, file_id, cid, c, module_guess)
+
+            # file imports surface
+            upsert_file_imports(cur, file_id, sorted(list(file_level_imports)), lang)
 
             # Intra-file call edges
             new_edges = 0
@@ -866,22 +1138,11 @@ def main():
                             insert_edge_if_absent(cur, src_id, dst_id, edge_type="calls", weight=1.0)
                             new_edges += 1
 
-                # (Optional) very coarse import edges (within same file only)
-                # If you prefer not to add these, comment this block out.
-                # for src_id, _calls, _src_sym in chunk_ids_and_calls:
-                #     for c in chunks:
-                #         for imp in c.imports or []:
-                #             # simple heuristic: connect to all chunks in same file
-                #             for dst_id, _dst_sym, _dst_kind in [x for lst in name_to_chunks.values() for x in lst]:
-                #                 if dst_id != src_id:
-                #                     insert_edge_if_absent(cur, src_id, dst_id, edge_type="imports", weight=0.2)
-                #                     new_edges += 1
-
                 total_edges += new_edges
 
             log.info(f"[file] {rel_path}: chunks={len(chunks)} edges+={new_edges} bytes={size_bytes} lang={lang or 'unknown'}")
 
-            # commit periodically to keep memory in check
+            # commit periodically
             if total_files % 50 == 0:
                 conn.commit()
                 log.info(f"[progress] files={total_files} chunks={total_chunks} edges={total_edges} (committed)")
@@ -890,6 +1151,18 @@ def main():
         update_repository_sha(cur, repo_id, head_sha)
 
         conn.commit()
+
+        # Cross-file materializer
+        if args.build_edges:
+            try:
+                cur.execute("SELECT build_cross_file_call_edges(3, 0.62)")
+                created = cur.fetchone()[0]
+                conn.commit()
+                log.info(f"[cross-file] edges+={created}")
+            except Exception as e:
+                conn.rollback()
+                log.warning(f"[cross-file] materialization failed: {e}")
+
         log.info(f"[done] files={total_files} chunks={total_chunks} edges={total_edges} sha={head_sha or 'n/a'}")
     except Exception as e:
         conn.rollback()
