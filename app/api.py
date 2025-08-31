@@ -1,24 +1,27 @@
 import os
-from typing import Literal, Optional, Dict, Any, List
+from typing import Literal, Optional, Dict, Any, List, TypedDict
 
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-# --- Existing DB config ---
+# --- DB config ---
 DB_DSN = os.getenv("DB_DSN", "postgresql://rag:ragpwd@pg:5432/ragdb")
 
 # --- LangGraph imports (keep the original demo alive) ---
-# We import lazily to avoid building graphs on module import.
 from langgraph.graph import StateGraph, START, END
 import ollama  # for the original langgraph demo
 
-# --- Strands agent wrapper (our new demo) ---
+# --- Strands agent wrapper (your demo) ---
 from app.strands_agent import run_with_rate_limits
 
 app = FastAPI(title="RAG PGVector API", version="2.0.0")
 
+
+# ------------------------------------------------------------------------------
+# Basics
+# ------------------------------------------------------------------------------
 
 def _conn():
     return psycopg2.connect(DB_DSN)
@@ -45,26 +48,28 @@ def _resolve_file(cur, repo_name: str, file_hint: str):
     """
     repo = _get_one(
         cur,
-        "SELECT id, name FROM rag.repositories WHERE name ILIKE %s LIMIT 1",
+        "SELECT id, name FROM repositories WHERE name ILIKE %s LIMIT 1",
         (repo_name,),
     )
     if not repo:
         raise HTTPException(status_code=404, detail=f"Repo not found: {repo_name}")
     repo_id, repo_name_db = repo[0], repo[1]
 
-    # Try exact first
+    # Try exact path first
     exact = _get_one(
         cur,
-        "SELECT id, path FROM rag.files WHERE repo_id = %s AND path = %s LIMIT 1",
+        "SELECT id, path FROM code_files WHERE repository_id = %s AND path = %s LIMIT 1",
         (repo_id, file_hint),
     )
     if exact:
         return repo_id, repo_name_db, exact[0], exact[1]
 
+    # Otherwise, suffix/basename match
     like = f"%/{file_hint.lstrip('/')}" if "/" in file_hint else f"%/{file_hint}"
     matches = _all(
         cur,
-        "SELECT id, path FROM rag.files WHERE repo_id = %s AND path ILIKE %s "
+        "SELECT id, path FROM code_files "
+        "WHERE repository_id = %s AND path ILIKE %s "
         "ORDER BY LENGTH(path) ASC LIMIT 25",
         (repo_id, like),
     )
@@ -75,10 +80,10 @@ def _resolve_file(cur, repo_name: str, file_hint: str):
         )
 
     base = file_hint.split("/")[-1]
-    exact_base = [m for m in matches if m[1].endswith("/" + base)]
+    exact_base = [m for m in matches if m[1].endswith("/" + base) or m[1] == base]
     pick = exact_base[0] if exact_base else matches[0]
 
-    same_base = [m for m in matches if m[1].endswith("/" + base)]
+    same_base = [m for m in matches if m[1].endswith("/" + base) or m[1] == base]
     if len(same_base) > 1:
         raise HTTPException(
             status_code=400,
@@ -91,26 +96,34 @@ def _resolve_file(cur, repo_name: str, file_hint: str):
     return repo_id, repo_name_db, pick[0], pick[1]
 
 
+# ------------------------------------------------------------------------------
+# Graph traversal helpers (new-schema SQL)
+# ------------------------------------------------------------------------------
+
 def _edges_query(direction: Literal["in", "out"]) -> str:
+    """
+    direction='out'  : edges starting from chunks in the target file (fan-out)
+    direction='in'   : edges pointing into chunks in the target file (fan-in)
+    """
     if direction == "out":
         return """
         WITH RECURSIVE start AS (
-          SELECT id FROM rag.code_chunks
-          WHERE file_id = %s AND valid_to IS NULL
+          SELECT id FROM code_chunks
+          WHERE file_id = %s
         ),
         edges AS (
-          SELECT e.src_chunk_id, e.dst_chunk_id, 1 AS depth, e.relation
-          FROM rag.chunk_edges e
+          SELECT e.src_chunk_id, e.dst_chunk_id, 1 AS depth, e.edge_type
+          FROM chunk_edges e
           WHERE e.src_chunk_id IN (SELECT id FROM start)
           UNION ALL
-          SELECT e.src_chunk_id, e.dst_chunk_id, x.depth + 1, e.relation
-          FROM rag.chunk_edges e
+          SELECT e.src_chunk_id, e.dst_chunk_id, x.depth + 1, e.edge_type
+          FROM chunk_edges e
           JOIN edges x ON e.src_chunk_id = x.dst_chunk_id
           WHERE x.depth < %s
         )
         SELECT
           ed.depth,
-          ed.relation,
+          ed.edge_type AS relation,
           s.id          AS src_chunk_id,
           sf.path       AS src_path,
           s.symbol_name AS src_symbol,
@@ -121,32 +134,32 @@ def _edges_query(direction: Literal["in", "out"]) -> str:
           d.symbol_name AS dst_symbol,
           df.language   AS dst_language
         FROM edges ed
-        JOIN rag.code_chunks s ON s.id = ed.src_chunk_id AND s.valid_to IS NULL
-        JOIN rag.files sf      ON sf.id = s.file_id
-        JOIN rag.code_chunks d ON d.id = ed.dst_chunk_id AND d.valid_to IS NULL
-        JOIN rag.files df      ON df.id = d.file_id
-        WHERE sf.repo_id = %s AND df.repo_id = %s
+        JOIN code_chunks s ON s.id = ed.src_chunk_id
+        JOIN code_files  sf ON sf.id = s.file_id
+        JOIN code_chunks d ON d.id = ed.dst_chunk_id
+        JOIN code_files  df ON df.id = d.file_id
+        WHERE sf.repository_id = %s AND df.repository_id = %s
         ORDER BY ed.depth, sf.path, s.start_line, df.path;
         """
     else:
         return """
         WITH RECURSIVE start AS (
-          SELECT id FROM rag.code_chunks
-          WHERE file_id = %s AND valid_to IS NULL
+          SELECT id FROM code_chunks
+          WHERE file_id = %s
         ),
         edges AS (
-          SELECT e.src_chunk_id, e.dst_chunk_id, 1 AS depth, e.relation
-          FROM rag.chunk_edges e
+          SELECT e.src_chunk_id, e.dst_chunk_id, 1 AS depth, e.edge_type
+          FROM chunk_edges e
           WHERE e.dst_chunk_id IN (SELECT id FROM start)
           UNION ALL
-          SELECT e.src_chunk_id, e.dst_chunk_id, x.depth + 1, e.relation
-          FROM rag.chunk_edges e
+          SELECT e.src_chunk_id, e.dst_chunk_id, x.depth + 1, e.edge_type
+          FROM chunk_edges e
           JOIN edges x ON e.dst_chunk_id = x.src_chunk_id
           WHERE x.depth < %s
         )
         SELECT
           ed.depth,
-          ed.relation,
+          ed.edge_type AS relation,
           s.id          AS src_chunk_id,
           sf.path       AS src_path,
           s.symbol_name AS src_symbol,
@@ -157,15 +170,18 @@ def _edges_query(direction: Literal["in", "out"]) -> str:
           d.symbol_name AS dst_symbol,
           df.language   AS dst_language
         FROM edges ed
-        JOIN rag.code_chunks s ON s.id = ed.src_chunk_id AND s.valid_to IS NULL
-        JOIN rag.files sf      ON sf.id = s.file_id
-        JOIN rag.code_chunks d ON d.id = ed.dst_chunk_id AND d.valid_to IS NULL
-        JOIN rag.files df      ON df.id = d.file_id
-        WHERE sf.repo_id = %s AND df.repo_id = %s
+        JOIN code_chunks s ON s.id = ed.src_chunk_id
+        JOIN code_files  sf ON sf.id = s.file_id
+        JOIN code_chunks d ON d.id = ed.dst_chunk_id
+        JOIN code_files  df ON df.id = d.file_id
+        WHERE sf.repository_id = %s AND df.repository_id = %s
         ORDER BY ed.depth, sf.path, s.start_line, df.path;
         """
 
-# ---------------------- Existing graph endpoints (unchanged) ------------------
+
+# ------------------------------------------------------------------------------
+# Graph endpoints
+# ------------------------------------------------------------------------------
 
 @app.get("/graph/relations")
 def graph_relations(
@@ -213,15 +229,16 @@ def graph_relations(
 
 
 def _impact_sql() -> str:
+    # NOTE: imports is TEXT[]; use ANY(imports) for array matching. content_tsv is TSVECTOR.
     return """
     WITH RECURSIVE
     start AS (
-      SELECT id FROM rag.code_chunks
-      WHERE file_id = %s AND valid_to IS NULL
+      SELECT id FROM code_chunks
+      WHERE file_id = %s
     ),
     direct_dep AS (
-      SELECT DISTINCT e.src_chunk_id, 1 AS depth, e.relation
-      FROM rag.chunk_edges e
+      SELECT DISTINCT e.src_chunk_id, 1 AS depth, e.edge_type
+      FROM chunk_edges e
       WHERE e.dst_chunk_id IN (SELECT id FROM start)
     ),
     dep AS (
@@ -229,36 +246,35 @@ def _impact_sql() -> str:
       FROM direct_dep
       UNION ALL
       SELECT e.src_chunk_id, d.depth + 1
-      FROM rag.chunk_edges e
+      FROM chunk_edges e
       JOIN dep d ON e.dst_chunk_id = d.src_chunk_id
       WHERE d.depth < %s
     ),
     dep_files AS (
       SELECT DISTINCT f.path, MIN(d.depth) AS min_depth
       FROM dep d
-      JOIN rag.code_chunks s ON s.id = d.src_chunk_id AND s.valid_to IS NULL
-      JOIN rag.files f       ON f.id = s.file_id
-      WHERE f.repo_id = %s
+      JOIN code_chunks s ON s.id = d.src_chunk_id
+      JOIN code_files f   ON f.id = s.file_id
+      WHERE f.repository_id = %s
       GROUP BY f.path
     ),
     import_refs AS (
       SELECT DISTINCT f.path
-      FROM rag.code_chunks c
-      JOIN rag.files f ON f.id = c.file_id
-      WHERE f.repo_id = %s
-        AND c.valid_to IS NULL
+      FROM code_chunks c
+      JOIN code_files f ON f.id = c.file_id
+      WHERE f.repository_id = %s
         AND EXISTS (
-          SELECT 1 FROM jsonb_array_elements_text(c.imports) imp(txt)
+          SELECT 1
+          FROM unnest(c.imports) AS imp(txt)
           WHERE txt ILIKE %s
         )
     ),
     lex_refs AS (
       SELECT DISTINCT f.path
-      FROM rag.code_chunks c
-      JOIN rag.files f ON f.id = c.file_id
-      WHERE f.repo_id = %s
-        AND c.valid_to IS NULL
-        AND c.content_tsv @@ plainto_tsquery('simple', %s)
+      FROM code_chunks c
+      JOIN code_files f ON f.id = c.file_id
+      WHERE f.repository_id = %s
+        AND c.content_tsv @@ plainto_tsquery('english', %s)
     ),
     unioned AS (
       SELECT df.path,
@@ -274,7 +290,7 @@ def _impact_sql() -> str:
     ),
     clean AS (
       SELECT * FROM unioned u
-      WHERE u.path <> (SELECT path FROM rag.files WHERE id = %s)
+      WHERE u.path <> (SELECT path FROM code_files WHERE id = %s)
     )
     SELECT path,
            MIN(min_depth) AS min_depth,
@@ -313,16 +329,16 @@ def graph_impact(
             cur,
             sql,
             (
-                file_id,
+                file_id,                 # start.file_id
                 depth,
-                repo_id,
-                repo_id,
-                import_like,
-                repo_id,
-                token,
-                token,
-                token,
-                file_id,
+                repo_id,                 # dep_files repo
+                repo_id,                 # import_refs repo
+                import_like,             # import match
+                repo_id,                 # lex_refs repo
+                token,                   # lex token
+                token,                   # reason string (imports)
+                token,                   # reason string (lexical)
+                file_id,                 # clean: exclude self
                 limit_files,
             ),
         )
@@ -347,10 +363,14 @@ def graph_impact(
 
         return result
 
-# -------------------------- Ask endpoints: Strands vs LangGraph ---------------
+
+# ------------------------------------------------------------------------------
+# Ask endpoints: Strands vs. LangGraph
+# ------------------------------------------------------------------------------
 
 class AskIn(BaseModel):
     question: str
+
 
 @app.post("/ask/strands")
 def ask_strands(payload: AskIn):
@@ -366,100 +386,99 @@ def ask_strands(payload: AskIn):
     answer = run_with_rate_limits(user_prompt)
     return {"engine": "strands", "answer": answer}
 
-# ------- LangGraph adapter (minimal): reuse your original retrieve/generate ----
 
-# We mirror the original State and nodes inline so we don't rely on side effects
-from typing import TypedDict
-import time as _time
+# ------- LangGraph adapter (minimal): reuse your original retrieve/generate ----
 
 class LGState(TypedDict):
     question: str
     context: str
     answer: str
 
+
 EMB_MODEL = os.getenv("EMB_MODEL", "mxbai-embed-large:latest")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.1:8b")
 OLLAMA_BASE = os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 _ollama = ollama.Client(host=OLLAMA_BASE)
 
+
 def _norm_model(s: str) -> str:
     s = (s or "").strip()
     return s if ":" in s else f"{s}:latest"
 
+
 def _as_vector_literal(vec):
+    # pgvector array literal for parameterized queries
     return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+
 
 SYS = (
     "You are a senior code assistant. Use the provided repository context strictly.\n"
     "Cite file/line provenance already included in the context comments. If context is insufficient, say so briefly."
 )
 
+
 def _retrieve(state: LGState) -> LGState:
+    """
+    Direct hybrid retriever over the new schema (no rag.* dependencies).
+    Produces stitched, provenance-tagged context snippets.
+    """
     q = state["question"]
+    # Embed the question via Ollama
     res = _ollama.embeddings(model=_norm_model(EMB_MODEL), prompt=q)
     q_emb = res["embedding"]
     q_emb_lit = _as_vector_literal(q_emb)
 
     with psycopg2.connect(DB_DSN) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SET LOCAL statement_timeout = '15000ms';")
-        try:
-            sql = """
-                WITH q AS (
-                  SELECT %s::vector AS emb,
-                         plainto_tsquery('simple', unaccent(%s)) AS tsq,
-                         %s AS qraw
-                ),
-                scored AS (
-                  SELECT
-                    v.id, v.repo_name, v.path, v.language,
-                    v.symbol_name, v.symbol_kind, v.symbol_signature,
-                    v.start_line, v.end_line, v.content,
-                    1 - (v.embedding <=> (SELECT emb FROM q)) AS vec_score,
-                    ts_rank_cd(v.content_tsv, (SELECT tsq FROM q)) AS lex_score
-                  FROM rag.v_chunk_search v
-                  WHERE ( (SELECT tsq FROM q) @@ v.content_tsv OR (SELECT emb FROM q) IS NOT NULL )
-                )
-                SELECT *, (0.7*vec_score + 0.3*lex_score) AS s
-                FROM scored
-                ORDER BY s DESC
-                LIMIT 12;
-            """
-            cur.execute(sql, (q_emb_lit, q, q))
-        except psycopg2.Error:
-            sql = """
-                WITH q AS (
-                  SELECT %s::vector AS emb,
-                         plainto_tsquery('simple', %s) AS tsq,
-                         %s AS qraw
-                ),
-                scored AS (
-                  SELECT
-                    v.id, v.repo_name, v.path, v.language,
-                    v.symbol_name, v.symbol_kind, v.symbol_signature,
-                    v.start_line, v.end_line, v.content,
-                    1 - (v.embedding <=> (SELECT emb FROM q)) AS vec_score,
-                    ts_rank_cd(v.content_tsv, (SELECT tsq FROM q)) AS lex_score
-                  FROM rag.v_chunk_search v
-                  WHERE ( (SELECT tsq FROM q) @@ v.content_tsv OR (SELECT emb FROM q) IS NOT NULL )
-                )
-                SELECT *, (0.7*vec_score + 0.3*lex_score) AS s
-                FROM scored
-                ORDER BY s DESC
-                LIMIT 12;
-            """
-            cur.execute(sql, (q_emb_lit, q, q))
+        # Hybrid: lexical (tsvector) + vector similarity on code_chunks
+        # NOTE: we use english parser for tsv; adjust if you prefer 'simple'
+        sql = """
+            WITH q AS (
+              SELECT %s::vector AS emb,
+                     plainto_tsquery('english', %s) AS tsq
+            ),
+            scored AS (
+              SELECT
+                c.id,
+                r.name  AS repo_name,
+                f.path  AS path,
+                c.language,
+                c.symbol_name,
+                c.symbol_kind,
+                c.start_line,
+                c.end_line,
+                c.content,
+                CASE WHEN c.embedding IS NOT NULL
+                     THEN 1 - (c.embedding <=> (SELECT emb FROM q))
+                     ELSE 0.0
+                END AS vec_score,
+                ts_rank_cd(c.content_tsv, (SELECT tsq FROM q)) AS lex_score
+              FROM code_chunks c
+              JOIN code_files f ON f.id = c.file_id
+              JOIN repositories r ON r.id = f.repository_id
+              WHERE ( (SELECT tsq FROM q) @@ c.content_tsv ) OR c.embedding IS NOT NULL
+            )
+            SELECT *,
+                   (0.7*vec_score + 0.3*lex_score) AS s
+            FROM scored
+            ORDER BY s DESC
+            LIMIT 12;
+        """
+        cur.execute(sql, (q_emb_lit, q))
         rows = cur.fetchall()
 
     if not rows:
         stitched = "// No results found for the question."
     else:
+        # Include provenance line as a comment on each snippet
         stitched = "\n\n".join(
             f"// {r['repo_name']}:{r['path']}:{r['start_line']}-{r['end_line']} "
-            f"[{r['symbol_signature'] or r['symbol_name'] or ''}]\n{r['content']}"
+            f"[{(r['symbol_name'] or '')}]"
+            f"\n{r['content']}"
             for r in rows
         )
     state["context"] = stitched
     return state
+
 
 def _generate_answer(state: LGState) -> LGState:
     ctx = state["context"]
@@ -482,6 +501,7 @@ def _generate_answer(state: LGState) -> LGState:
     state["answer"] = "".join(content_parts).strip()
     return state
 
+
 def _build_langgraph_app():
     g = StateGraph(LGState)
     g.add_node("retrieve", _retrieve)
@@ -491,7 +511,9 @@ def _build_langgraph_app():
     g.add_edge("generate_answer", END)
     return g.compile()
 
+
 _langgraph_app = None
+
 
 def get_langgraph_app():
     global _langgraph_app
@@ -499,10 +521,11 @@ def get_langgraph_app():
         _langgraph_app = _build_langgraph_app()
     return _langgraph_app
 
+
 @app.post("/ask/langgraph")
 def ask_langgraph(payload: AskIn):
     """
-    Uses the original LangGraph-style pipeline.
+    Uses the original LangGraph-style pipeline over the new schema.
     """
     app_ = get_langgraph_app()
     out = app_.invoke({"question": payload.question, "context": "", "answer": ""})

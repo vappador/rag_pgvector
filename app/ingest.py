@@ -1,613 +1,679 @@
 # app/ingest.py
-import os
-import re
+"""
+Repo ingestion for code-focused RAG (Postgres + pgvector).
+
+Features:
+- Inserts/updates repositories, code_files, code_chunks per the new schema.
+- AST-aware chunking with Tree-sitter (java/ts/js/py), graceful fallback to whole-file chunk.
+- Extracts symbol_name/symbol_kind, imports, calls, ast json, language, start_line/end_line.
+- Computes content_hash for incremental/idem-potent updates.
+- Optional incremental ingest via git diff or last_ingested_sha.
+- Optional on-the-fly embeddings via Ollama (--embed).
+
+ENV / CLI:
+  PG_DSN              : psycopg2 DSN (default: dbname=rag user=postgres host=db password=postgres)
+  OLLAMA_HOST         : base URL (default: http://ollama:11434)
+  TS_LANG_SO          : path to tree-sitter language bundle (default: build/my-languages.so)
+
+Example:
+  docker compose exec app python /workspace/app/ingest.py \
+    --repo-dir /workspace/repo --repo-name rag_pgvector \
+    --repo-url https://github.com/vappador/rag_pgvector --embed --embed-model mxbai-embed-large
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
-import logging
-import traceback
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Any
 
 import psycopg2
 import psycopg2.extras
-from git import Repo
-from tqdm import tqdm
 
-# Tree-sitter: use get_parser only (avoid ABI issues with get_language)
-from tree_sitter_languages import get_parser
+# ------------------------------ Optional deps ---------------------------------
 
-# Ollama: local embeddings
-import ollama
+# Tree-sitter (optional)
+TS_AVAILABLE = False
+PARSER_BY_LANG: Dict[str, "Parser"] = {}
+LANG_SO_DEFAULT = str(Path("build") / "my-languages.so")
+TS_LANG_SO = os.environ.get("TS_LANG_SO", LANG_SO_DEFAULT)
 
-# -----------------------
-# Config & logging
-# -----------------------
-DB_DSN = os.getenv("DB_DSN", "postgresql://rag:ragpwd@localhost:5432/ragdb")
+try:
+    from tree_sitter import Language, Parser  # type: ignore
 
-OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-EMB_MODEL = os.getenv("EMB_MODEL", "mxbai-embed-large")  # 1024-d
-EMB_DIM = int(os.getenv("EMB_DIM", "1024"))
+    if Path(TS_LANG_SO).exists():
+        _LANGS = {}
+        # Add/remove languages here as you like; ensure your .so was built with these grammars.
+        for lang_name in ("java", "typescript", "javascript", "python"):
+            try:
+                _LANGS[lang_name] = Language(TS_LANG_SO, lang_name)
+            except Exception:
+                pass  # ignore missing grammars in the bundle
 
-_ollama = ollama.Client(host=OLLAMA_BASE)
+        for name, ts_lang in _LANGS.items():
+            p = Parser()
+            p.set_language(ts_lang)
+            PARSER_BY_LANG[name] = p
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-log = logging.getLogger("ingest")
+        TS_AVAILABLE = len(PARSER_BY_LANG) > 0
+except Exception:
+    TS_AVAILABLE = False
 
-# -----------------------
-# Language detection & filters
-# -----------------------
-LANG_MAP = {
+# Ollama (optional, only used when --embed)
+OLLAMA_AVAILABLE = False
+try:
+    import ollama  # type: ignore
+
+    OLLAMA_AVAILABLE = True
+except Exception:
+    OLLAMA_AVAILABLE = False
+
+# ------------------------------ Helpers ---------------------------------------
+
+LANG_EXTS = {
+    ".java": "java",
     ".ts": "typescript",
     ".tsx": "typescript",
     ".js": "javascript",
     ".jsx": "javascript",
-    ".java": "java",
-}
-TEST_HINTS = re.compile(r"(^|/)(test|tests|spec|__tests__|__spec__)/", re.I)
-SKIP_DIRS = {"node_modules", "dist", "build", "target", ".git", ".idea", ".vscode"}
-SKIP_FILE_SUBSTR = {".min.", ".map."}
-
-# Calls stoplist (reduce noise from control keywords / builtins)
-CALLS_STOP = {
-    "if", "for", "while", "switch", "catch", "return", "class", "function", "new",
-    "throw", "await", "super", "this", "try", "typeof", "console", "log"
+    ".py": "python",
 }
 
-# -----------------------
-# Helpers
-# -----------------------
-def is_code(p: Path) -> bool:
-    if p.suffix.lower() not in LANG_MAP:
-        return False
-    if any(part.lower() in SKIP_DIRS for part in p.parts):
-        return False
-    name = p.name.lower()
-    if any(sub in name for sub in SKIP_FILE_SUBSTR):
-        return False
-    return True
+def detect_language(path: Path) -> Optional[str]:
+    return LANG_EXTS.get(path.suffix.lower())
 
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def language_for(p: Path) -> str:
-    return LANG_MAP.get(p.suffix.lower(), "other")
-
-
-def to_text(src: bytes, start: int, end: int) -> str:
-    return src[start:end].decode("utf-8", errors="ignore")
-
-
-def as_vector_literal(vec: List[float]) -> str:
-    """Format a Python list of floats as pgvector's textual literal: [0.1,0.2,...]"""
-    return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
-
-
-def zeros_vec(dim: int) -> List[float]:
-    return [0.0] * dim
-
-
-def safe_dim(vec: List[float], dim: int) -> List[float]:
-    """Pad or truncate to expected dimension."""
-    if len(vec) == dim:
-        return vec
-    if len(vec) > dim:
-        return vec[:dim]
-    return vec + [0.0] * (dim - len(vec))
-
-
-def embed_one(text: str, retries: int = 2) -> List[float]:
-    """Embed a single text with retries; return zeros on failure to avoid NULLs."""
-    for i in range(retries + 1):
-        try:
-            r = _ollama.embeddings(model=EMB_MODEL, prompt=text)
-            emb = r.get("embedding")
-            if not emb:
-                raise RuntimeError("No 'embedding' in Ollama response")
-            return safe_dim(emb, EMB_DIM)
-        except Exception as e:
-            if i < retries:
-                log.warning("Embedding retry %d/%d: %s", i + 1, retries, e)
-            else:
-                log.error("Embedding failed; using zeros. Error: %s", e)
-                log.debug("Traceback:\n%s", traceback.format_exc())
-                return zeros_vec(EMB_DIM)
-
-
-def embed_batch(texts: List[str]) -> List[List[float]]:
-    """Per-text embed to isolate failures; still fairly quick for typical chunk counts."""
-    return [embed_one(t) for t in texts]
-
-
-def extract_ts(js: bool = False):
-    """Return ready-to-use parser; avoid get_language to sidestep ABI issues."""
-    return get_parser("javascript" if js else "typescript")
-
-
-def extract_java():
-    return get_parser("java")
-
-
-def fallback_window_chunks(
-    code: str, win: int = 120, overlap: int = 20
-) -> List[Tuple[int, int, str, Optional[str], Optional[str], Optional[str], Optional[str], list, list]]:
-    """Fallback windowed chunking when AST parsing fails."""
-    lines = code.splitlines()
-    if not lines:
-        return []
-    i = 0
-    chunks = []
-    while i < len(lines):
-        s, e = i, min(i + win, len(lines))
-        txt = "\n".join(lines[s:e])
-        chunks.append((s + 1, e, txt, None, None, None, None, [], []))
-        if e == len(lines):
-            break
-        i = e - overlap
-    return chunks
-
-
-def _guess_symbol(header: str, langname: str) -> Tuple[Optional[str], Optional[str], str]:
-    """
-    Try hard to extract (name, kind, signature) from the first line of the chunk.
-    Handles common TS/JS and Java patterns.
-    """
-    sig = header.strip()
-
-    # Classes / interfaces (TS/JS/Java)
-    m = re.search(r"\bclass\s+([A-Za-z_]\w*)", header)
-    if m:
-        return m.group(1), "class", sig
-    m = re.search(r"\binterface\s+([A-Za-z_]\w*)", header)
-    if m:
-        return m.group(1), "class", sig  # treat interfaces as class-kind
-
-    # Java method: modifiers then name(...)
-    m = re.search(r"(?:public|private|protected|static|final|\s)+([A-Za-z_]\w*)\s*\(", header)
-    if m and langname == "java":
-        return m.group(1), "function", sig
-
-    # JS/TS: function declaration / export default function
-    m = re.search(r"\bfunction\s+([A-Za-z_]\w*)", header)
-    if m:
-        return m.group(1), "function", sig
-    m = re.search(r"\bexport\s+default\s+function\s+([A-Za-z_]\w*)", header)
-    if m:
-        return m.group(1), "function", sig
-
-    # JS/TS: var-assigned fn or arrow fn: const/let/var name = ( or function
-    m = re.search(r"\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?(?:function|\()", header)
-    if m:
-        return m.group(1), "function", sig
-
-    # Methods (TS/JS inside classes): modifiers then name(
-    m = re.search(r"(?:public|private|protected|static|readonly|async|\s)+([A-Za-z_]\w*)\s*\(", header)
-    if m:
-        return m.group(1), "function", sig
-
-    # Last resort: any identifier followed by '('
-    m = re.search(r"\b([A-Za-z_]\w*)\s*\(", header)
-    if m and m.group(1) not in CALLS_STOP:
-        return m.group(1), "function", sig
-
-    return None, None, sig
-
-
-def ts_java_symbols(
-    p: Path, code: str, langname: str
-) -> List[Tuple[int, int, str, Optional[str], Optional[str], Optional[str], Optional[str], list, list]]:
-    """
-    Extract symbol-level chunks using Tree-sitter. On parser errors,
-    gracefully falls back to windowed chunking.
-
-    Returns list of:
-      (start_line, end_line, text, symbol_name, symbol_kind, signature, doc, imports, calls)
-    """
-    src = code.encode("utf-8", errors="ignore")
-
-    # Choose parser (safe)
+def git_root(path: Path) -> Optional[Path]:
     try:
-        if langname == "java":
-            parser = extract_java()
-            import_kind = "import_declaration"
-            fnkinds = ("method_declaration",)
-            clskinds = ("class_declaration", "interface_declaration", "enum_declaration")
-        else:
-            parser = extract_ts(js=(langname == "javascript"))
-            import_kind = "import_statement"
-            fnkinds = ("function_declaration", "method_definition")
-            clskinds = ("class_declaration",)
-    except Exception as e:
-        log.warning("Parser init failed for %s: %s; falling back to windowing", p, e)
-        log.debug("Traceback:\n%s", traceback.format_exc())
-        return fallback_window_chunks(code)
-
-    # Parse (safe)
-    try:
-        tree = parser.parse(src)
-    except Exception as e:
-        log.warning("Parser.parse() failed for %s: %s; falling back to windowing", p, e)
-        log.debug("Traceback:\n%s", traceback.format_exc())
-        return fallback_window_chunks(code)
-
-    if not tree or not getattr(tree, "root_node", None):
-        log.warning("No parse tree for %s; falling back to windowing", p)
-        return fallback_window_chunks(code)
-
-    root = tree.root_node
-
-    def lines_of(node):
-        return node.start_point[0] + 1, node.end_point[0] + 1
-
-    chunks = []
-
-    # Top-level imports (best-effort)
-    imports = []
-    try:
-        for n in root.children:
-            if getattr(n, "type", None) == import_kind:
-                imports.append(to_text(src, n.start_byte, n.end_byte).strip())
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], cwd=str(path)
+        ).decode().strip()
+        return Path(out)
     except Exception:
-        pass  # not fatal
+        return None
 
-    # DFS for classes & functions
-    stack = [root]
+def git_head_sha(repo_dir: Path) -> Optional[str]:
+    try:
+        return (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo_dir))
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return None
+
+def git_changed_files(repo_dir: Path, base_ref: str) -> List[Path]:
+    try:
+        out = subprocess.check_output(
+            ["git", "diff", "--name-only", base_ref, "HEAD"], cwd=str(repo_dir)
+        ).decode()
+        return [repo_dir / p for p in out.splitlines() if p.strip()]
+    except Exception:
+        return []
+
+# ------------------------------ AST chunking ----------------------------------
+
+@dataclass
+class Chunk:
+    language: str
+    symbol_kind: str          # class|method|function|module
+    symbol_name: str          # e.g., Person#updateEmail or function name
+    start_line: int
+    end_line: int
+    content: str
+    imports: List[str]
+    calls: List[str]
+    ast: Dict[str, Any]
+
+def _node_text(source: bytes, node) -> str:
+    return source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+
+def _walk(node) -> Iterable:
+    stack = [node]
     while stack:
         n = stack.pop()
-        try:
-            stack.extend(n.children)
-        except Exception:
-            continue
+        yield n
+        for i in reversed(range(n.child_count)):
+            stack.append(n.child(i))
 
-        try:
-            ntype = getattr(n, "type", "")
-            if ntype in clskinds or ntype in fnkinds:
-                start_l, end_l = lines_of(n)
-                text = to_text(src, n.start_byte, n.end_byte)
-
-                # Signature & symbol heuristics from header only
-                header = text.split("\n", 1)[0][:300]
-                name, kind, sig = _guess_symbol(header, langname)
-                if ntype in clskinds:
-                    kind = "class"
-
-                # Doc: previous sibling comment if present
-                doc = None
-                prev = getattr(n, "prev_sibling", None)
-                if prev is not None and getattr(prev, "type", "") in ("comment", "block_comment"):
-                    doc = to_text(src, prev.start_byte, prev.end_byte).strip()
-
-                # Light call extraction: foo( … ), filter stop words
-                calls = sorted(
-                    {m for m in re.findall(r"\b([A-Za-z_]\w*)\s*\(", text) if m not in CALLS_STOP}
-                )[:50]
-
-                chunks.append((start_l, end_l, text, name, kind, sig, doc, imports[:50], calls))
-        except Exception:
-            log.debug("Node processing failed on %s; continuing.\n%s", p, traceback.format_exc())
-            continue
-
-    if not chunks:
-        return fallback_window_chunks(code)
-
-    return chunks
-
-
-def upsert(conn, sql, params):
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchone()[0]
-
-
-def build_edges_for_repo(conn, repo_id: int):
+def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
     """
-    Populate rag.chunk_edges for a repo:
-      - 'calls' edges: src.calls[] -> dst.symbol_name match within same repo
-      - 'imports' edges (js/ts): module token -> matching target files (incl. index.*)
-      - 'imports' edges (java): FQCN -> ClassName.java
+    AST-aware chunking per language. Gracefully returns [] if parser missing.
     """
-    with conn.cursor() as cur:
-        # Remove existing edges for this repo to avoid duplicates
-        cur.execute(
-            """
-            DELETE FROM rag.chunk_edges e
-            USING rag.code_chunks s
-            JOIN rag.files sf ON sf.id = s.file_id
-            WHERE e.src_chunk_id = s.id AND sf.repo_id = %s
-            """,
-            (repo_id,),
-        )
+    if not TS_AVAILABLE or lang not in PARSER_BY_LANG:
+        return []
 
-        # ---- calls edges (symbol-name match) ----
-        cur.execute(
-            """
-            INSERT INTO rag.chunk_edges (src_chunk_id, dst_chunk_id, relation)
-            SELECT DISTINCT
-              src.id  AS src_chunk_id,
-              dst.id  AS dst_chunk_id,
-              'calls' AS relation
-            FROM rag.code_chunks src
-            JOIN rag.files sf ON sf.id = src.file_id
-            JOIN LATERAL jsonb_array_elements_text(src.calls) AS c(name) ON TRUE
-            JOIN rag.code_chunks dst
-              ON lower(dst.symbol_name) = lower(c.name)
-            JOIN rag.files df ON df.id = dst.file_id
-            WHERE src.valid_to IS NULL
-              AND dst.valid_to IS NULL
-              AND sf.repo_id = %s
-              AND df.repo_id = %s
-            """,
-            (repo_id, repo_id),
-        )
+    parser = PARSER_BY_LANG[lang]
+    source = path.read_bytes()
+    tree = parser.parse(source)
+    root = tree.root_node
 
-        # ---- imports edges (JS/TS) ----
-        cur.execute(
-            """
-            WITH src AS (
-              SELECT cc.id AS src_chunk_id, f.id AS src_file_id, f.repo_id, f.path AS src_path,
-                     regexp_matches(imp, $$from\\s+['"]([^'"]+)['"]|require\\(\\s*['"]([^'"]+)['"]\\s*\\)$$, 'i') AS m
-              FROM rag.code_chunks cc
-              JOIN rag.files f ON f.id = cc.file_id
-              CROSS JOIN LATERAL jsonb_array_elements_text(cc.imports) AS imp
-              WHERE f.language IN ('javascript','typescript') AND cc.valid_to IS NULL AND f.repo_id = %s
-            ),
-            mods AS (
-              SELECT src_chunk_id, src_file_id, repo_id, src_path,
-                     COALESCE(NULLIF(m[1],''), NULLIF(m[2],'')) AS modname
-              FROM src
-            ),
-            targets AS (
-              SELECT DISTINCT
-                s.src_chunk_id, s.src_file_id, s.repo_id, s.src_path, s.modname,
-                tf.id AS dst_file_id
-              FROM mods s
-              JOIN rag.files tf ON tf.repo_id = s.repo_id
-              WHERE s.modname IS NOT NULL
-                AND (
-                  tf.path ILIKE '%%/' || split_part(s.modname, '/', array_length(string_to_array(s.modname,'/'),1)) || '.ts'  OR
-                  tf.path ILIKE '%%/' || split_part(s.modname, '/', array_length(string_to_array(s.modname,'/'),1)) || '.tsx' OR
-                  tf.path ILIKE '%%/' || split_part(s.modname, '/', array_length(string_to_array(s.modname,'/'),1)) || '.js'  OR
-                  tf.path ILIKE '%%/' || split_part(s.modname, '/', array_length(string_to_array(s.modname,'/'),1)) || '.jsx' OR
-                  tf.path ILIKE '%%/' || split_part(s.modname, '/', array_length(string_to_array(s.modname,'/'),1)) || '/index.ts'  OR
-                  tf.path ILIKE '%%/' || split_part(s.modname, '/', array_length(string_to_array(s.modname,'/'),1)) || '/index.tsx' OR
-                  tf.path ILIKE '%%/' || split_part(s.modname, '/', array_length(string_to_array(s.modname,'/'),1)) || '/index.js'  OR
-                  tf.path ILIKE '%%/' || split_part(s.modname, '/', array_length(string_to_array(s.modname,'/'),1)) || '/index.jsx'
-                )
-            )
-            INSERT INTO rag.chunk_edges (src_chunk_id, dst_chunk_id, relation)
-            SELECT DISTINCT
-              t.src_chunk_id,
-              dc.id AS dst_chunk_id,
-              'imports'
-            FROM targets t
-            JOIN rag.code_chunks dc ON dc.file_id = t.dst_file_id AND dc.valid_to IS NULL
-            """,
-            (repo_id,),
-        )
+    chunks: List[Chunk] = []
 
-        # ---- imports edges (Java) ----
-        cur.execute(
-            """
-            WITH java_imps AS (
-              SELECT cc.id AS src_chunk_id, f.id AS src_file_id, f.repo_id,
-                     (regexp_matches(imp, $$import\\s+([A-Za-z0-9_.]+);$$, 'i'))[1] AS fqcn
-              FROM rag.code_chunks cc
-              JOIN rag.files f ON f.id = cc.file_id
-              CROSS JOIN LATERAL jsonb_array_elements_text(cc.imports) AS imp
-              WHERE f.language = 'java' AND cc.valid_to IS NULL AND f.repo_id = %s
-            ),
-            cls AS (
-              SELECT src_chunk_id, src_file_id, repo_id,
-                     split_part(fqcn, '.', array_length(string_to_array(fqcn, '.'),1)) AS cls_name
-              FROM java_imps WHERE fqcn IS NOT NULL
-            ),
-            tgt AS (
-              SELECT DISTINCT j.src_chunk_id, j.repo_id, jf.id AS dst_file_id
-              FROM cls j
-              JOIN rag.files jf ON jf.repo_id = j.repo_id
-              WHERE jf.path ILIKE '%%/' || j.cls_name || '.java'
-            )
-            INSERT INTO rag.chunk_edges (src_chunk_id, dst_chunk_id, relation)
-            SELECT DISTINCT
-              t.src_chunk_id,
-              dc.id AS dst_chunk_id,
-              'imports'
-            FROM tgt t
-            JOIN rag.code_chunks dc ON dc.file_id = t.dst_file_id AND dc.valid_to IS NULL
-            """,
-            (repo_id,),
-        )
+    if lang == "java":
+        # imports
+        imports = set()
+        for n in _walk(root):
+            if n.type == "import_declaration":
+                text = _node_text(source, n).strip().rstrip(";")
+                if text.startswith("import"):
+                    imports.add(text.replace("import", "", 1).strip())
 
-    conn.commit()
-    log.info("chunk_edges backfilled for repo_id=%s", repo_id)
-
-
-# -----------------------
-# Main ingestion routine
-# -----------------------
-def ingest_repo(repo_url: str, dest: Path, repo_name: Optional[str] = None):
-    # Clone or pull
-    try:
-        if dest.exists():
-            repo = Repo(str(dest))
-            repo.remote().pull()
-            log.info("Pulled latest for %s", dest)
-        else:
-            repo = Repo.clone_from(repo_url, str(dest))
-            log.info("Cloned %s into %s", repo_url, dest)
-    except Exception as e:
-        log.error("Git operation failed for %s: %s", repo_url, e)
-        log.debug("Traceback:\n%s", traceback.format_exc())
-        return
-
-    if not repo_name:
-        repo_name = Path(repo_url.rstrip("/").split("/")[-1]).stem
-
-    try:
-        default_branch = repo.active_branch.name
-    except Exception:
-        default_branch = "main"
-
-    with psycopg2.connect(DB_DSN) as conn:
-        conn.autocommit = False
-
-        # repositories row
-        rid = upsert(
-            conn,
-            """
-            INSERT INTO rag.repositories(name,url,default_branch)
-            VALUES(%s,%s,%s)
-            ON CONFLICT (name) DO UPDATE
-              SET url=EXCLUDED.url, default_branch=EXCLUDED.default_branch
-            RETURNING id
-            """,
-            (repo_name, repo_url, default_branch),
-        )
-
-        head = repo.head.commit
-        committed_dt = datetime.fromtimestamp(head.committed_date)
-
-        # commits row
-        cid = upsert(
-            conn,
-            """
-            INSERT INTO rag.commits(repo_id,commit_hash,author,committed_at,message)
-            VALUES(%s,%s,%s,%s,%s)
-            ON CONFLICT (repo_id,commit_hash) DO UPDATE
-              SET author=EXCLUDED.author, committed_at=EXCLUDED.committed_at, message=EXCLUDED.message
-            RETURNING id
-            """,
-            (rid, head.hexsha, getattr(head.author, "name", None), committed_dt, head.message),
-        )
-
-        files = [p for p in dest.rglob("*") if p.is_file() and is_code(p)]
-        log.info("Found %d code files in %s", len(files), repo_name)
-
-        for p in tqdm(files, desc=f"Ingest {repo_name}"):
-            try:
-                rel = p.relative_to(dest).as_posix()
-                lang = language_for(p)
-                is_test = bool(TEST_HINTS.search(rel))
-                size = p.stat().st_size
-                text = p.read_text(encoding="utf-8", errors="ignore")
-
-                # Extract chunks (AST → fallback window)
-                chunks = ts_java_symbols(p, text, lang)
-                if not chunks:
-                    log.debug("No chunks produced for %s; skipping file.", rel)
+        # classes -> methods
+        for class_node in _walk(root):
+            if class_node.type in ("class_declaration", "interface_declaration"):
+                class_name = None
+                # class name is an identifier descendant
+                for ch in _walk(class_node):
+                    if ch.type == "identifier":
+                        class_name = _node_text(source, ch)
+                        break
+                if not class_name:
                     continue
 
-                with conn.cursor() as cur:
-                    # files row
-                    cur.execute(
-                        """
-                        INSERT INTO rag.files(repo_id,path,language,is_test,size_bytes,latest_commit_id)
-                        VALUES(%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (repo_id,path) DO UPDATE SET
-                          language=EXCLUDED.language,
-                          is_test=EXCLUDED.is_test,
-                          size_bytes=EXCLUDED.size_bytes,
-                          latest_commit_id=EXCLUDED.latest_commit_id
-                        RETURNING id
-                        """,
-                        (rid, rel, lang, is_test, size, cid),
-                    )
-                    file_id = cur.fetchone()[0]
+                for n in _walk(class_node):
+                    if n.type in ("method_declaration", "constructor_declaration"):
+                        meth_name = None
+                        for ch in _walk(n):
+                            if ch.type == "identifier":
+                                meth_name = _node_text(source, ch)
+                                break
+                        if not meth_name:
+                            continue
 
-                    # Embeddings (safe, per text)
-                    texts = [c[2] for c in chunks]
-                    embs = embed_batch(texts)
-                    emb_strs = [as_vector_literal(e) for e in embs]
+                        calls = set()
+                        for ch in _walk(n):
+                            if ch.type == "method_invocation":
+                                for idn in _walk(ch):
+                                    if idn.type == "identifier":
+                                        calls.add(_node_text(source, idn))
+                                        break
 
-                    # Prepare batch rows
-                    rows = []
-                    for idx, ((s, e, txt, name, kind, sig, doc, imports, calls), emb_str) in enumerate(
-                        zip(chunks, emb_strs)
-                    ):
-                        rows.append(
-                            (
-                                file_id,
-                                idx,
-                                s,
-                                e,
-                                name,
-                                kind,
-                                sig,
-                                doc,
-                                psycopg2.extras.Json(imports),
-                                psycopg2.extras.Json(calls),
-                                txt,
-                                emb_str,
-                                len(txt.split()),
-                                committed_dt,
+                        start_line = n.start_point[0] + 1
+                        end_line = n.end_point[0] + 1
+                        content = _node_text(source, n)
+                        symbol = f"{class_name}#{meth_name}"
+                        chunks.append(
+                            Chunk(
+                                language=lang,
+                                symbol_kind="method",
+                                symbol_name=symbol,
+                                start_line=start_line,
+                                end_line=end_line,
+                                content=content,
+                                imports=sorted(imports),
+                                calls=sorted(calls),
+                                ast={"class": class_name, "method": meth_name},
                             )
                         )
 
-                    psycopg2.extras.execute_values(
-                        cur,
-                        """
-                        INSERT INTO rag.code_chunks
-                          (file_id,chunk_index,start_line,end_line,symbol_name,symbol_kind,symbol_signature,doc_comment,imports,calls,
-                           content,embedding,token_count,committed_at)
-                        VALUES %s
-                        ON CONFLICT (file_id,chunk_index) DO UPDATE SET
-                          start_line=EXCLUDED.start_line,
-                          end_line=EXCLUDED.end_line,
-                          symbol_name=EXCLUDED.symbol_name,
-                          symbol_kind=EXCLUDED.symbol_kind,
-                          symbol_signature=EXCLUDED.symbol_signature,
-                          doc_comment=EXCLUDED.doc_comment,
-                          imports=EXCLUDED.imports,
-                          calls=EXCLUDED.calls,
-                          content=EXCLUDED.content,
-                          embedding=EXCLUDED.embedding,
-                          token_count=EXCLUDED.token_count,
-                          committed_at=EXCLUDED.committed_at,
-                          valid_to=NULL
-                        """,
-                        rows,
+    elif lang in ("typescript", "javascript"):
+        imports = set()
+        for n in _walk(root):
+            if n.type == "import_declaration":
+                imports.add(_node_text(source, n).strip())
+
+        # function declarations
+        for n in _walk(root):
+            if n.type == "function_declaration":
+                name = None
+                for ch in _walk(n):
+                    if ch.type == "identifier":
+                        name = _node_text(source, ch)
+                        break
+                if name:
+                    calls = set()
+                    for ch in _walk(n):
+                        if ch.type == "call_expression":
+                            for idn in _walk(ch):
+                                if idn.type == "identifier":
+                                    calls.add(_node_text(source, idn))
+                                    break
+                    chunks.append(
+                        Chunk(
+                            language=lang,
+                            symbol_kind="function",
+                            symbol_name=name,
+                            start_line=n.start_point[0] + 1,
+                            end_line=n.end_point[0] + 1,
+                            content=_node_text(source, n),
+                            imports=sorted(imports),
+                            calls=sorted(calls),
+                            ast={"function": name},
+                        )
                     )
 
-                conn.commit()
-            except Exception as e:
-                # Skip file but keep ingesting the rest
-                conn.rollback()
-                log.error("Failed to ingest file %s: %s", p, e)
-                log.debug("Traceback:\n%s", traceback.format_exc())
+        # class methods
+        for n in _walk(root):
+            if n.type == "class_declaration":
+                class_name = None
+                for ch in _walk(n):
+                    if ch.type == "identifier":
+                        class_name = _node_text(source, ch)
+                        break
+                if not class_name:
+                    continue
+                for m in _walk(n):
+                    if m.type == "method_definition":
+                        meth_name = None
+                        for idn in _walk(m):
+                            if idn.type in ("property_identifier", "identifier"):
+                                meth_name = _node_text(source, idn)
+                                break
+                        if not meth_name:
+                            continue
+                        calls = set()
+                        for ch in _walk(m):
+                            if ch.type == "call_expression":
+                                for idn in _walk(ch):
+                                    if idn.type == "identifier":
+                                        calls.add(_node_text(source, idn))
+                                        break
+                        chunks.append(
+                            Chunk(
+                                language=lang,
+                                symbol_kind="method",
+                                symbol_name=f"{class_name}#{meth_name}",
+                                start_line=m.start_point[0] + 1,
+                                end_line=m.end_point[0] + 1,
+                                content=_node_text(source, m),
+                                imports=sorted(imports),
+                                calls=sorted(calls),
+                                ast={"class": class_name, "method": meth_name},
+                            )
+                        )
+
+    elif lang == "python":
+        imports = set()
+        for n in _walk(root):
+            if n.type in ("import_statement", "import_from_statement"):
+                imports.add(_node_text(source, n).strip())
+
+        # top-level functions
+        for n in _walk(root):
+            if n.type == "function_definition":
+                name = None
+                for ch in _walk(n):
+                    if ch.type == "identifier":
+                        name = _node_text(source, ch)
+                        break
+                if name:
+                    calls = set()
+                    for ch in _walk(n):
+                        if ch.type == "call":
+                            # target of call stored in field 'function'
+                            fn = ch.child_by_field_name("function")
+                            if fn is not None:
+                                target = _node_text(source, fn)
+                                if target:
+                                    calls.add(target.split("(")[0].strip())
+                    chunks.append(
+                        Chunk(
+                            language=lang,
+                            symbol_kind="function",
+                            symbol_name=name,
+                            start_line=n.start_point[0] + 1,
+                            end_line=n.end_point[0] + 1,
+                            content=_node_text(source, n),
+                            imports=sorted(imports),
+                            calls=sorted(calls),
+                            ast={"function": name},
+                        )
+                    )
+
+        # classes + methods
+        for n in _walk(root):
+            if n.type == "class_definition":
+                class_name = None
+                for ch in _walk(n):
+                    if ch.type == "identifier":
+                        class_name = _node_text(source, ch)
+                        break
+                if not class_name:
+                    continue
+                for m in _walk(n):
+                    if m.type == "function_definition":
+                        meth_name = None
+                        for idn in _walk(m):
+                            if idn.type == "identifier":
+                                meth_name = _node_text(source, idn)
+                                break
+                        if not meth_name:
+                            continue
+                        calls = set()
+                        for ch in _walk(m):
+                            if ch.type == "call":
+                                fn = ch.child_by_field_name("function")
+                                if fn is not None:
+                                    target = _node_text(source, fn)
+                                    if target:
+                                        calls.add(target.split("(")[0].strip())
+                        chunks.append(
+                            Chunk(
+                                language=lang,
+                                symbol_kind="method",
+                                symbol_name=f"{class_name}#{meth_name}",
+                                start_line=m.start_point[0] + 1,
+                                end_line=m.end_point[0] + 1,
+                                content=_node_text(source, m),
+                                imports=sorted(imports),
+                                calls=sorted(calls),
+                                ast={"class": class_name, "method": meth_name},
+                            )
+                        )
+
+    return chunks
+
+def chunk_file_fallback(path: Path, lang: str) -> List[Chunk]:
+    """
+    Fallback when AST not available: one module-level chunk = entire file.
+    """
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    lines = text.splitlines()
+    return [
+        Chunk(
+            language=lang or "unknown",
+            symbol_kind="module",
+            symbol_name=path.name,
+            start_line=1,
+            end_line=len(lines) if lines else 1,
+            content=text,
+            imports=[],
+            calls=[],
+            ast={"file": str(path), "language": lang or "unknown"},
+        )
+    ]
+
+def make_chunks(path: Path) -> List[Chunk]:
+    lang = detect_language(path)
+    if not lang:
+        return []
+    chunks = chunk_file_ast(path, lang)
+    if not chunks:
+        chunks = chunk_file_fallback(path, lang)
+    # enrich ast with file name & lang
+    for c in chunks:
+        c.ast = dict(c.ast or {})
+        c.ast.setdefault("file", str(path))
+        c.ast.setdefault("language", lang)
+        c.language = lang
+    return chunks
+
+# ------------------------------ DB upserts ------------------------------------
+
+def get_or_create_repository(cur, name: str, url: str) -> int:
+    cur.execute(
+        """
+        INSERT INTO repositories (name, url)
+        VALUES (%s, %s)
+        ON CONFLICT (name) DO UPDATE SET url = EXCLUDED.url
+        RETURNING id
+        """,
+        (name, url),
+    )
+    return cur.fetchone()[0]
+
+def update_repository_sha(cur, repo_id: int, sha: Optional[str]) -> None:
+    if not sha:
+        return
+    cur.execute(
+        "UPDATE repositories SET last_ingested_sha = %s WHERE id = %s",
+        (sha, repo_id),
+    )
+
+def upsert_code_file(
+    cur,
+    repository_id: int,
+    rel_path: str,
+    language: Optional[str],
+    size_bytes: int,
+    checksum: Optional[str],
+) -> int:
+    cur.execute(
+        """
+        INSERT INTO code_files (repository_id, path, language, size_bytes, checksum)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (repository_id, path) DO UPDATE
+          SET language = EXCLUDED.language,
+              size_bytes = EXCLUDED.size_bytes,
+              checksum = EXCLUDED.checksum,
+              updated_at = now()
+        RETURNING id
+        """,
+        (repository_id, rel_path, language, size_bytes, checksum),
+    )
+    return cur.fetchone()[0]
+
+def upsert_code_chunk(
+    cur,
+    file_id: int,
+    c: Chunk,
+    embed: bool,
+    embed_model: Optional[str],
+) -> int:
+    """
+    Upsert a chunk by (file_id, start_line, end_line), compute content_hash,
+    optionally compute embedding via Ollama.
+    """
+    content_hash = sha256_text(
+        f"{c.symbol_kind}|{c.symbol_name}|{c.start_line}|{c.end_line}|{c.content}"
+    )
+
+    embedding = None
+    embedding_model = None
+    embedding_hash = None
+
+    if embed:
+        if not OLLAMA_AVAILABLE:
+            raise RuntimeError("Embedding requested but python 'ollama' package not available.")
+        model = embed_model or "mxbai-embed-large"
+        try:
+            resp = ollama.embeddings(model=model, prompt=c.content)
+            vec = resp.get("embedding")
+            if vec and isinstance(vec, list):
+                embedding = vec
+                embedding_model = model
+                embedding_hash = sha256_text(c.content)  # hash of the input to embedding
+        except Exception as e:
+            # Don't fail ingestion if embedding fails; just proceed without it
+            print(f"[warn] embedding failed for {c.symbol_name}: {e}", file=sys.stderr)
+
+    cur.execute(
+        """
+        INSERT INTO code_chunks
+          (file_id, start_line, end_line, content, language,
+           symbol_kind, symbol_name, imports, calls, ast,
+           embedding, embedding_model, embedding_hash, content_hash)
+        VALUES
+          (%s, %s, %s, %s, %s,
+           %s, %s, %s, %s, %s,
+           %s, %s, %s, %s)
+        ON CONFLICT (file_id, start_line, end_line) DO UPDATE SET
+           content = EXCLUDED.content,
+           language = EXCLUDED.language,
+           symbol_kind = EXCLUDED.symbol_kind,
+           symbol_name = EXCLUDED.symbol_name,
+           imports = EXCLUDED.imports,
+           calls = EXCLUDED.calls,
+           ast = EXCLUDED.ast,
+           content_hash = EXCLUDED.content_hash,
+           -- only overwrite embedding when we provided one this time
+           embedding = COALESCE(EXCLUDED.embedding, code_chunks.embedding),
+           embedding_model = COALESCE(EXCLUDED.embedding_model, code_chunks.embedding_model),
+           embedding_hash = COALESCE(EXCLUDED.embedding_hash, code_chunks.embedding_hash),
+           updated_at = now()
+        RETURNING id
+        """,
+        (
+            file_id,
+            c.start_line,
+            c.end_line,
+            c.content,
+            c.language,
+            c.symbol_kind,
+            c.symbol_name,
+            c.imports,
+            c.calls,
+            psycopg2.extras.Json(c.ast),
+            embedding,
+            embedding_model,
+            embedding_hash,
+            content_hash,
+        ),
+    )
+    return cur.fetchone()[0]
+
+# ------------------------------ Main ingest -----------------------------------
+
+def iter_candidate_files(
+    repo_dir: Path,
+    only_changed: bool,
+    base_ref: Optional[str],
+    follow_symlinks: bool,
+    max_file_size_bytes: Optional[int],
+) -> List[Path]:
+    if only_changed and base_ref:
+        candidates = git_changed_files(repo_dir, base_ref)
+    else:
+        candidates = []
+        for p in repo_dir.rglob("*"):
+            try:
+                if p.is_symlink() and not follow_symlinks:
+                    continue
+                if p.is_file():
+                    candidates.append(p)
+            except Exception:
                 continue
 
-        # Analyze for better ANN/BM25 performance
+    # Filter by language/extensions, size
+    out: List[Path] = []
+    for p in candidates:
+        if detect_language(p) is None:
+            continue
         try:
-            with conn.cursor() as cur:
-                cur.execute("ANALYZE rag.code_chunks;")
-            conn.commit()
-        except Exception as e:
-            log.warning("ANALYZE failed (non-fatal): %s", e)
+            if max_file_size_bytes is not None and p.stat().st_size > max_file_size_bytes:
+                continue
+        except Exception:
+            pass
+        out.append(p)
+    return out
 
-        # Build edges for this repo (calls/imports)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo-dir", required=True, help="Path to local git working tree")
+    ap.add_argument("--repo-name", required=True)
+    ap.add_argument("--repo-url", default="")
+    ap.add_argument("--dsn", default=os.environ.get("PG_DSN", "dbname=rag user=postgres host=db password=postgres"))
+
+    ap.add_argument("--changed-only", action="store_true", help="Ingest only files changed since base ref / last ingested SHA")
+    ap.add_argument("--base-ref", default=None, help="Git base ref for --changed-only (e.g., origin/main). If absent, uses repositories.last_ingested_sha when available.")
+    ap.add_argument("--follow-symlinks", action="store_true")
+    ap.add_argument("--max-file-size", type=int, default=2_000_000, help="Skip files larger than this many bytes (default 2MB)")
+
+    ap.add_argument("--embed", action="store_true", help="Compute and store embeddings via Ollama")
+    ap.add_argument("--embed-model", default="mxbai-embed-large", help="Ollama embedding model (default: mxbai-embed-large)")
+
+    args = ap.parse_args()
+
+    repo_dir = Path(args.repo_dir).resolve()
+    if not repo_dir.exists():
+        print(f"[error] repo_dir not found: {repo_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # Git SHA & base ref logic
+    head_sha = git_head_sha(repo_dir)
+    base_ref = args.base_ref
+    root = git_root(repo_dir)
+    if args.changed-only and not base_ref and root is None:
+        print("[warn] --changed-only requested but not a git repo; ignoring.", file=sys.stderr)
+
+    conn = psycopg2.connect(args.dsn)
+    conn.autocommit = False
+    cur = conn.cursor()
+
+    try:
+        repo_id = get_or_create_repository(cur, args.repo_name, args.repo_url)
+
+        # If --changed-only and no explicit base-ref, use repositories.last_ingested_sha
+        if args.changed-only and not base_ref:
+            cur.execute("SELECT last_ingested_sha FROM repositories WHERE id = %s", (repo_id,))
+            row = cur.fetchone()
+            base_ref = row[0] if row and row[0] else None
+
+        files = iter_candidate_files(
+            repo_dir=repo_dir,
+            only_changed=args.changed-only,
+            base_ref=base_ref,
+            follow_symlinks=args.follow_symlinks,
+            max_file_size_bytes=args.max_file_size,
+        )
+
+        total_files = 0
+        total_chunks = 0
+
+        for fp in files:
+            total_files += 1
+            rel_path = str(fp.relative_to(repo_dir)) if root else str(fp)
+            lang = detect_language(fp)
+            try:
+                size_bytes = fp.stat().st_size
+            except Exception:
+                size_bytes = 0
+
+            # file checksum for optional audits (entire file content)
+            try:
+                checksum = sha256_text(fp.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                checksum = None
+
+            file_id = upsert_code_file(
+                cur,
+                repository_id=repo_id,
+                rel_path=rel_path,
+                language=lang,
+                size_bytes=size_bytes,
+                checksum=checksum,
+            )
+
+            chunks = make_chunks(fp)
+            for c in chunks:
+                _ = upsert_code_chunk(
+                    cur,
+                    file_id=file_id,
+                    c=c,
+                    embed=args.embed,
+                    embed_model=args.embed_model,
+                )
+                total_chunks += 1
+
+            # commit periodically to keep memory in check
+            if total_files % 50 == 0:
+                conn.commit()
+                print(f"[info] processed {total_files} files, {total_chunks} chunks...")
+
+        # record last ingested sha if we have one
+        update_repository_sha(cur, repo_id, head_sha)
+
+        conn.commit()
+        print(f"[done] files={total_files} chunks={total_chunks} sha={head_sha or 'n/a'}")
+    except Exception as e:
+        conn.rollback()
+        print(f"[error] {e}", file=sys.stderr)
+        raise
+    finally:
         try:
-            build_edges_for_repo(conn, rid)
-        except Exception as e:
-            log.warning("Edge backfill failed (non-fatal): %s", e)
-            log.debug("Traceback:\n%s", traceback.format_exc())
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
 
-
-# -----------------------
-# Entrypoint
-# -----------------------
 if __name__ == "__main__":
-    repo_urls = [u.strip() for u in os.getenv("REPO_URLS", "").split(",") if u.strip()]
-    if not repo_urls:
-        log.error('No REPO_URLS provided. Example: REPO_URLS="https://github.com/expressjs/express.git,https://github.com/spring-projects/spring-petclinic.git"')
-        raise SystemExit(2)
-
-    base = Path("/workspace/repos")
-    base.mkdir(parents=True, exist_ok=True)
-
-    for url in repo_urls:
-        name = Path(url.rstrip("/").split("/")[-1]).stem
-        dest = base / name
-        log.info("Ingesting repo: %s -> %s", url, dest)
-        ingest_repo(url, dest, repo_name=name)
-
-    log.info("Ingestion complete.")
+    main()
