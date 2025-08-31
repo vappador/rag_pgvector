@@ -262,6 +262,51 @@ LIMIT 10;
 -- ORDER BY c.embedding <-> '[ /* 1024 floats here */ ]'::vector
 -- LIMIT 10;
 
+/* =============================================================================
+   13) How many calls did we capture vs edges built
+   ============================================================================= */
+-- total call tokens recorded
+SELECT SUM(array_length(calls,1)) AS total_calls
+FROM code_chunks;
+
+-- edges proportion
+SELECT
+  (SELECT COUNT(*) FROM chunk_edges WHERE edge_type='calls') AS call_edges,
+  (SELECT SUM(array_length(calls,1)) FROM code_chunks)       AS recorded_calls,
+  (SELECT COUNT(*)::float / NULLIF(SUM(array_length(calls,1)),0)
+     FROM code_chunks, LATERAL (SELECT 1) s)                 AS dummy_ratio; -- just placeholder
+
+-- per-file effectiveness
+SELECT r.name AS repo, f.path,
+       SUM(array_length(c.calls,1)) AS calls_recorded,
+       SUM(CE.edge_count) AS call_edges
+FROM code_files f
+JOIN repositories r ON r.id=f.repository_id
+JOIN code_chunks c ON c.file_id=f.id
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS edge_count
+  FROM chunk_edges e WHERE e.src_chunk_id = c.id AND e.edge_type='calls'
+) CE ON TRUE
+GROUP BY 1,2
+ORDER BY calls_recorded DESC NULLS LAST;
+
+/* =============================================================================
+   14) find callers that still don't resolve
+   ============================================================================= */
+WITH caller_calls AS (
+  SELECT c.id AS src_chunk_id, unnest(c.calls) AS call FROM code_chunks c
+),
+resolved AS (
+  SELECT DISTINCT e.src_chunk_id FROM chunk_edges e WHERE e.edge_type='calls'
+)
+SELECT cc.call, COUNT(*) AS misses
+    FROM caller_calls cc
+LEFT JOIN resolved r ON r.src_chunk_id = cc.src_chunk_id
+WHERE r.src_chunk_id IS NULL
+GROUP BY cc.call
+ORDER BY misses DESC
+LIMIT 50;
+
 
 /* =============================================================================
    (Optional) Maintenance tips after bulk ingest
