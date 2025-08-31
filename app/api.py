@@ -11,12 +11,17 @@ DB_DSN = os.getenv("DB_DSN", "postgresql://rag:ragpwd@pg:5432/ragdb")
 
 # --- LangGraph imports (keep the original demo alive) ---
 from langgraph.graph import StateGraph, START, END
-import ollama  # for the original langgraph demo
+import ollama  # used by langgraph path
 
-# --- Strands agent wrapper (your demo) ---
+# --- Strands agent wrapper (existing demo) ---
 from app.strands_agent import run_with_rate_limits
 
-app = FastAPI(title="RAG PGVector API", version="2.0.0")
+# --- New retrieval/reranking/answering modules ---
+from app.search import search_hybrid
+from app.rerankers import Candidate, CrossEncoderReranker, LLMJudgeReranker
+from app.answering import synthesize_answer
+
+app = FastAPI(title="RAG PGVector API", version="2.1.0")
 
 
 # ------------------------------------------------------------------------------
@@ -229,7 +234,7 @@ def graph_relations(
 
 
 def _impact_sql() -> str:
-    # NOTE: imports is TEXT[]; use ANY(imports) for array matching. content_tsv is TSVECTOR.
+    # imports is TEXT[]; match via unnest. content_tsv is TSVECTOR ('english').
     return """
     WITH RECURSIVE
     start AS (
@@ -365,7 +370,62 @@ def graph_impact(
 
 
 # ------------------------------------------------------------------------------
-# Ask endpoints: Strands vs. LangGraph
+# Search + (optional) reranking
+# ------------------------------------------------------------------------------
+
+def _to_candidates(rows: List[Dict[str, Any]]) -> List[Candidate]:
+    # Expecting keys from search_hybrid: id, repo_name, path, start_line, end_line,
+    # symbol_name, content, hybrid_score (or score)
+    out: List[Candidate] = []
+    for r in rows:
+        out.append(
+            Candidate(
+                chunk_id=r["id"],
+                repo=r["repo_name"],
+                path=r["path"],
+                start_line=r["start_line"],
+                end_line=r["end_line"],
+                content=r["content"],
+                symbol=r.get("symbol_name"),
+                score=float(r.get("hybrid_score") or r.get("score") or 0.0),
+            )
+        )
+    return out
+
+
+@app.get("/search")
+def search(
+    q: str = Query(..., description="Search query"),
+    language: Optional[str] = Query(None, description="Filter by language (java|typescript|javascript|python)"),
+    topn: int = Query(50, ge=1, le=200),
+    k: int = Query(10, ge=1, le=50),
+    rerank: bool = Query(False),
+    reranker: Literal["cross", "judge"] = Query("cross"),
+    w_vec: float = Query(0.7, ge=0.0, le=1.0),
+    w_lex: float = Query(0.3, ge=0.0, le=1.0),
+):
+    rows = search_hybrid(q, language=language, topn=topn, w_vec=w_vec, w_lex=w_lex)
+    cands = _to_candidates(rows)
+
+    if rerank and cands:
+        rr = CrossEncoderReranker() if reranker == "cross" else LLMJudgeReranker()
+        cands = rr.rerank(q, cands, top_k=k)
+    else:
+        cands = cands[:k]
+
+    stitched = "\n\n".join(
+        f"// {c.repo}:{c.path}:{c.start_line}-{c.end_line} [{c.symbol or ''}]\n{c.content}"
+        for c in cands
+    )
+    return {
+        "query": q,
+        "results": [c.__dict__ for c in cands],
+        "stitched_context": stitched,
+    }
+
+
+# ------------------------------------------------------------------------------
+# Ask endpoints: Strands vs. LangGraph vs. direct (new)
 # ------------------------------------------------------------------------------
 
 class AskIn(BaseModel):
@@ -385,6 +445,29 @@ def ask_strands(payload: AskIn):
     )
     answer = run_with_rate_limits(user_prompt)
     return {"engine": "strands", "answer": answer}
+
+
+class SimpleAskIn(BaseModel):
+    question: str
+    language: Optional[str] = None
+    context_k: int = 6
+    rerank: bool = True
+    reranker: Literal["cross", "judge"] = "cross"
+
+
+@app.post("/ask")
+def ask_simple(payload: SimpleAskIn):
+    """
+    Direct ask path that uses the new search + rerank + provenance-first synthesis.
+    """
+    rows = search_hybrid(payload.question, language=payload.language, topn=50, w_vec=0.7, w_lex=0.3)
+    cands = _to_candidates(rows)
+    if payload.rerank and cands:
+        rr = CrossEncoderReranker() if payload.reranker == "cross" else LLMJudgeReranker()
+        cands = rr.rerank(payload.question, cands, top_k=payload.context_k)
+    else:
+        cands = cands[:payload.context_k]
+    return {"engine": "direct", **synthesize_answer(payload.question, cands)}
 
 
 # ------- LangGraph adapter (minimal): reuse your original retrieve/generate ----
@@ -407,7 +490,7 @@ def _norm_model(s: str) -> str:
 
 
 def _as_vector_literal(vec):
-    # pgvector array literal for parameterized queries
+    # pgvector-style literal for parameterized queries
     return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
 
 
@@ -430,7 +513,6 @@ def _retrieve(state: LGState) -> LGState:
 
     with psycopg2.connect(DB_DSN) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         # Hybrid: lexical (tsvector) + vector similarity on code_chunks
-        # NOTE: we use english parser for tsv; adjust if you prefer 'simple'
         sql = """
             WITH q AS (
               SELECT %s::vector AS emb,
