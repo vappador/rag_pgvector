@@ -16,6 +16,7 @@ What this version does:
 - Flags:
   - --build-edges / --no-build-edges (default: on). Env: BUILD_EDGES=1/0.
   - --embed to compute embeddings.
+  - --report (or REPORT=1) to print a read-only ingestion quality report (key metrics).
 
 NOTE: Cross-file edge logic is materialized in SQL and invoked once at end of run.
 """
@@ -149,7 +150,7 @@ def git_changed_files(repo_dir: Path, base_ref: str) -> List[Path]:
 class Chunk:
     language: str
     symbol_kind: str          # class|method|function|module|module_part
-    symbol_name: str          # e.g., Person#updateEmail or function name (may be FQN for Java)
+    symbol_name: str          # e.g., Person#updateEmail or FQN for Java
     start_line: int
     end_line: int
     content: str
@@ -188,7 +189,6 @@ def _py_call_name(src: bytes, call_node) -> Optional[str]:
     if fn.type == "attribute":
         parts = []
         cur = fn
-        # Walk left along attribute chain to collect "a.b.c"
         while cur is not None:
             if cur.type == "attribute":
                 attr = cur.child_by_field_name("attribute")
@@ -224,7 +224,13 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
         java_package = None
         for node in _walk(root):
             if node.type == "package_declaration":
-                java_package = _node_text(source, node).strip().replace("package", "").rstrip(";").strip()
+                java_package = (
+                    _node_text(source, node)
+                    .strip()
+                    .replace("package", "")
+                    .rstrip(";")
+                    .strip()
+                )
                 break
 
         # imports
@@ -289,7 +295,6 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                         start_line = n.start_point[0] + 1
                         end_line = n.end_point[0] + 1
                         content = _node_text(source, n)
-                        # prefer FQN when package is known
                         fq_sym = f"{java_package}.{class_name}#{meth_name}" if java_package else f"{class_name}#{meth_name}"
                         ast_meta = {"class": class_name, "method": meth_name}
                         if java_package:
@@ -476,13 +481,9 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
 
     return chunks
 
-# ------------------------------ Fallback chunking (windowed) -------------------
+# ------------------------------ Fallback chunking ------------------------------
 
-def _windowed_segments(
-    text: str,
-    max_chars: int = 1800,
-    overlap_chars: int = 300,
-) -> List[Tuple[int, int, str]]:
+def _windowed_segments(text: str, max_chars: int = 1800, overlap_chars: int = 300) -> List[Tuple[int, int, str]]:
     if len(text) <= max_chars:
         return [(0, len(text), text)]
     segs: List[Tuple[int, int, str]] = []
@@ -495,13 +496,7 @@ def _windowed_segments(
         start = max(0, end - overlap_chars)
     return segs
 
-def chunk_file_fallback(
-    path: Path,
-    lang: str,
-    max_chars: int,
-    overlap_chars: int,
-    verbose_filename: str,
-) -> List[Chunk]:
+def chunk_file_fallback(path: Path, lang: str, max_chars: int, overlap_chars: int, verbose_filename: str) -> List[Chunk]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines() or [""]
     segs = _windowed_segments(text, max_chars=max_chars, overlap_chars=overlap_chars)
@@ -538,34 +533,19 @@ def chunk_file_fallback(
                 content=seg,
                 imports=[],
                 calls=[],
-                ast={
-                    "file": str(path),
-                    "language": lang or "unknown",
-                    "part": idx,
-                    "offset_range": [start_idx, end_idx],
-                },
+                ast={"file": str(path), "language": lang or "unknown", "part": idx, "offset_range": [start_idx, end_idx]},
             )
         )
     return chunks
 
-def make_chunks(
-    path: Path,
-    max_chars: int = 1800,
-    overlap_chars: int = 300,
-) -> List[Chunk]:
+def make_chunks(path: Path, max_chars: int = 1800, overlap_chars: int = 300) -> List[Chunk]:
     lang = detect_language(path)
     if not lang:
         return []
     chunks = chunk_file_ast(path, lang)
     if chunks:
         return chunks
-    return chunk_file_fallback(
-        path=path,
-        lang=lang,
-        max_chars=max_chars,
-        overlap_chars=overlap_chars,
-        verbose_filename=str(path),
-    )
+    return chunk_file_fallback(path=path, lang=lang, max_chars=max_chars, overlap_chars=overlap_chars, verbose_filename=str(path))
 
 # ------------------------------ DB helpers ------------------------------------
 
@@ -584,20 +564,9 @@ def get_or_create_repository(cur, name: str, url: str) -> int:
 def update_repository_sha(cur, repo_id: int, sha: Optional[str]) -> None:
     if not sha:
         return
-    cur.execute(
-        "UPDATE repositories SET last_ingested_sha = %s WHERE id = %s",
-        (sha, repo_id),
-    )
+    cur.execute("UPDATE repositories SET last_ingested_sha = %s WHERE id = %s", (sha, repo_id))
 
-def upsert_code_file(
-    cur,
-    repository_id: int,
-    rel_path: str,
-    language: Optional[str],
-    size_bytes: int,
-    checksum: Optional[str],
-    module: Optional[str],
-) -> int:
+def upsert_code_file(cur, repository_id: int, rel_path: str, language: Optional[str], size_bytes: int, checksum: Optional[str], module: Optional[str]) -> int:
     cur.execute(
         """
         INSERT INTO code_files (repository_id, path, language, size_bytes, checksum, module)
@@ -652,17 +621,8 @@ def simple_symbol_name(symbol_name: str) -> str:
         return symbol_name.split("#", 1)[1] or symbol_name
     return symbol_name
 
-def upsert_code_chunk(
-    cur,
-    file_id: int,
-    c: Chunk,
-    embed: bool,
-    embed_model: Optional[str],
-    embed_max_chars: int,
-) -> int:
-    content_hash = sha256_text(
-        f"{c.symbol_kind}|{c.symbol_name}|{c.start_line}|{c.end_line}|{c.content}"
-    )
+def upsert_code_chunk(cur, file_id: int, c: Chunk, embed: bool, embed_model: Optional[str], embed_max_chars: int) -> int:
+    content_hash = sha256_text(f"{c.symbol_kind}|{c.symbol_name}|{c.start_line}|{c.end_line}|{c.content}")
 
     embedding = None
     embedding_model = None
@@ -746,9 +706,6 @@ def upsert_code_chunk(
 def parse_import(raw: str, lang: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
     Return (module, symbol) best-effort.
-    - Java: "com.acme.pkg.ClassName" -> ("com.acme.pkg", "ClassName")
-    - TS/JS: "import {foo as bar} from 'lib/x'" -> ("lib/x", "foo"); "import x from 'lib/x'" -> ("lib/x", None or 'default')
-    - Python: "from pkg.mod import fn" -> ("pkg.mod", "fn") ; "import pkg.mod as m" -> ("pkg.mod", None)
     """
     if not raw:
         return (None, None)
@@ -763,11 +720,6 @@ def parse_import(raw: str, lang: Optional[str]) -> Tuple[Optional[str], Optional
                 return (t, None)
 
         if lang in ("typescript", "javascript"):
-            # extremely light-weight parse
-            # examples:
-            #   import X from 'lib/x'
-            #   import {foo as bar, baz} from "lib/x"
-            #   import * as ns from 'lib/x'
             mod = None
             sym = None
             if " from " in text:
@@ -784,24 +736,21 @@ def parse_import(raw: str, lang: Optional[str]) -> Tuple[Optional[str], Optional
             elif "import * as" in text:
                 sym = None
             elif text.startswith("import "):
-                # default import
                 rest = text[len("import "):].strip()
                 if rest and not rest.startswith("{") and not rest.startswith("*") and " from " in rest:
                     default_sym = rest.split(" from ",1)[0].strip()
                     if default_sym and default_sym not in ("", ";"):
-                        sym = None  # treat default as None
+                        sym = None
             return (mod, sym)
 
         if lang == "python":
             if text.startswith("from "):
-                # from pkg.mod import fn, g
                 parts = text.split()
                 if len(parts) >= 4 and parts[0] == "from" and parts[2] == "import":
                     mod = parts[1].strip()
                     sym = parts[3].split(",")[0].strip()
                     return (mod, sym)
             if text.startswith("import "):
-                # import pkg.mod as m
                 mod = text.split()[1].split(",")[0].strip()
                 return (mod, None)
     except Exception:
@@ -812,10 +761,7 @@ def upsert_file_imports(cur, file_id: int, imports: List[str], lang: Optional[st
     for raw in imports or []:
         module, symbol = parse_import(raw, lang)
         cur.execute(
-            """
-            INSERT INTO file_imports(file_id, raw_import, module, symbol)
-            VALUES (%s, %s, %s, %s)
-            """,
+            "INSERT INTO file_imports(file_id, raw_import, module, symbol) VALUES (%s, %s, %s, %s)",
             (file_id, raw, module, symbol),
         )
 
@@ -823,13 +769,10 @@ def _is_exported(c: Chunk) -> bool:
     try:
         ex = c.ast.get("exports")
         if isinstance(ex, list):
-            # naive: if any export text mentions our simple name, mark exported
             sname = simple_symbol_name(c.symbol_name)
             return any(sname in e for e in ex)
     except Exception:
         pass
-    # Python top-level function treated as exported-ish;
-    # Java methods aren’t usually exported; return False by default.
     return c.symbol_kind == "function" and c.language == "python"
 
 def upsert_code_symbol(cur, repo_id: int, file_id: int, chunk_id: int, c: Chunk, module: Optional[str]) -> None:
@@ -862,13 +805,11 @@ def derive_module(repo_root: Optional[Path], file_path: Path, lang: Optional[str
         if lang == "java":
             if java_package:
                 return java_package
-            # fallback: derive from path segments after 'java' or 'src'
             p = str(file_path).replace("\\", "/")
             if "/java/" in p:
                 after = p.split("/java/",1)[1]
                 if "/" in after:
                     parts = after.split("/")
-                    # drop filename
                     return ".".join(parts[:-1])
             if repo_root and file_path.is_relative_to(repo_root):
                 rel = file_path.relative_to(repo_root)
@@ -877,7 +818,6 @@ def derive_module(repo_root: Optional[Path], file_path: Path, lang: Optional[str
                     return ".".join(parts[:-1])
             return None
         if lang == "python":
-            # repo-relative dotted path without .py
             if repo_root and file_path.is_relative_to(repo_root):
                 rel = file_path.relative_to(repo_root)
                 parts = list(rel.parts)
@@ -886,7 +826,6 @@ def derive_module(repo_root: Optional[Path], file_path: Path, lang: Optional[str
                 return ".".join(parts[:-1]) if len(parts) > 1 else parts[0].replace(".py","")
             return file_path.stem
         if lang in ("typescript","javascript"):
-            # module path without extension, repo-relative
             if repo_root and file_path.is_relative_to(repo_root):
                 rel = file_path.relative_to(repo_root)
                 p = str(rel)
@@ -900,6 +839,133 @@ def derive_module(repo_root: Optional[Path], file_path: Path, lang: Optional[str
         return None
     except Exception:
         return None
+
+# ------------------------------ Reporting (read-only) --------------------------
+
+QUICK_REPORT_SQL = {
+    "overall": """
+        SELECT
+          (SELECT count(*) FROM repositories) AS repos,
+          (SELECT count(*) FROM code_files)   AS files,
+          (SELECT count(*) FROM code_chunks)  AS chunks,
+          (SELECT count(*) FROM chunk_edges)  AS edges;
+    """,
+    "embedding": """
+        SELECT
+          count(*) FILTER (WHERE embedding IS NOT NULL) AS with_emb,
+          count(*) FILTER (WHERE embedding IS NULL)     AS without_emb,
+          round(100.0 * count(*) FILTER (WHERE embedding IS NOT NULL) / NULLIF(count(*),0),1) AS pct_with_emb
+        FROM code_chunks;
+    """,
+    "raw_calls": """
+        WITH calls AS (
+          SELECT cardinality(calls) AS n_calls FROM code_chunks
+        )
+        SELECT
+          sum(n_calls) AS total_calls_recorded,
+          (SELECT count(*) FROM chunk_edges WHERE edge_type='calls') AS call_edges_created,
+          round(100.0 * (SELECT count(*) FROM chunk_edges WHERE edge_type='calls') / NULLIF(sum(n_calls),0), 1) AS pct_resolved_intra_file_raw
+        FROM calls;
+    """,
+    "eligible_calls": """
+        -- helpers are inline to avoid requiring CREATE FUNCTION permissions
+        WITH
+        norm_full AS (
+          SELECT 1
+        ),
+        defs AS (
+          SELECT
+            c.file_id,
+            array_agg(DISTINCT regexp_replace(regexp_replace(split_part(c.symbol_name,'#',2), '\\(.*\\)$', ''), '<[^>]+>', '', 'g'))
+              FILTER (WHERE c.symbol_name IS NOT NULL) AS defs_full
+          FROM code_chunks c
+          GROUP BY c.file_id
+        ),
+        calls_expanded AS (
+          SELECT
+            c.id AS src_chunk_id,
+            c.file_id,
+            regexp_replace(regexp_replace(split_part(x,'#',2), '\\(.*\\)$', ''), '<[^>]+>', '', 'g') AS call_full
+          FROM code_chunks c
+          LEFT JOIN LATERAL unnest(c.calls) AS x ON TRUE
+          WHERE x IS NOT NULL AND x <> ''
+        ),
+        eligible AS (
+          SELECT DISTINCT ce.src_chunk_id
+          FROM calls_expanded ce
+          JOIN defs d USING (file_id)
+          WHERE ce.call_full IS NOT NULL AND ce.call_full = ANY(d.defs_full)
+        ),
+        resolved_intra AS (
+          SELECT DISTINCT e.src_chunk_id
+          FROM chunk_edges e
+          JOIN code_chunks s ON s.id = e.src_chunk_id
+          JOIN code_chunks t ON t.id = e.dst_chunk_id
+          WHERE e.edge_type='calls' AND s.file_id = t.file_id
+        )
+        SELECT
+          (SELECT count(*) FROM eligible)       AS eligible_calls_intra_file,
+          (SELECT count(*) FROM resolved_intra) AS resolved_call_edges_intra_file,
+          ROUND(100.0 * (SELECT count(*) FROM resolved_intra) / NULLIF((SELECT count(*) FROM eligible),0), 1) AS pct_resolved_of_eligible_intra;
+    """
+}
+
+def _print_rowdicts(title: str, rows: List[dict]) -> None:
+    if not rows:
+        log.info(f"[report] {title}: <no rows>")
+        return
+    # pretty single-line JSON objects for logs
+    for r in rows:
+        log.info(f"[report] {title}: {json.dumps(r, default=str)}")
+
+def _fetch_all_dicts(cur, sql: str) -> List[dict]:
+    cur.execute(sql)
+    cols = [d.name for d in cur.description]
+    out = []
+    for row in cur.fetchall():
+        out.append({cols[i]: row[i] for i in range(len(cols))})
+    return out
+
+def run_quick_report(cur) -> None:
+    log.info("=== Ingestion Report (quick) ===")
+    for key in ("overall", "embedding", "raw_calls", "eligible_calls"):
+        try:
+            rows = _fetch_all_dicts(cur, QUICK_REPORT_SQL[key])
+            _print_rowdicts(key, rows)
+        except Exception as e:
+            log.warning(f"[report:{key}] failed: {e}")
+
+def run_sql_file_report(cur, sql_path: Path) -> bool:
+    """
+    Executes *read-only* statements (SELECT / WITH) from useful_sql.sql.
+    Returns True if at least one statement ran; otherwise False.
+    """
+    if not sql_path.exists():
+        return False
+    text = sql_path.read_text(encoding="utf-8", errors="ignore")
+    # naive split: keep only SELECT/WITH statements to stay read-only
+    stmts: List[str] = []
+    for part in text.split(";"):
+        s = part.strip()
+        if not s:
+            continue
+        head = s.split(None, 1)[0].upper()
+        if head in ("SELECT", "WITH"):
+            stmts.append(s)
+    ran_any = False
+    if not stmts:
+        return False
+    log.info(f"=== Ingestion Report ({sql_path}) ===")
+    for s in stmts:
+        try:
+            rows = _fetch_all_dicts(cur, s)
+            # derive a short tag from the first keyword/line
+            tag = s.splitlines()[0][:60].replace("\n", " ")
+            _print_rowdicts(tag, rows)
+            ran_any = True
+        except Exception as e:
+            log.warning(f"[report:file] skipped one statement: {e}")
+    return ran_any
 
 # ------------------------------ Main ingest -----------------------------------
 
@@ -944,44 +1010,34 @@ def main():
     ap.add_argument("--repo-url", default="")
 
     # DSN: prefer DB_DSN if present, else PG_DSN, else default
-    _dsn_default = (
-        os.environ.get("DB_DSN")
-        or os.environ.get("PG_DSN")
-        or "dbname=rag user=postgres host=db password=postgres"
-    )
+    _dsn_default = os.environ.get("DB_DSN") or os.environ.get("PG_DSN") or "dbname=rag user=postgres host=db password=postgres"
     ap.add_argument("--dsn", default=_dsn_default)
 
-    # Changed-only: accept both spellings
-    ap.add_argument("--changed-only", dest="changed_only", action="store_true",
-                    help="Ingest only files changed since base ref / last ingested SHA")
-    ap.add_argument("--changed_only", dest="changed_only", action="store_true",
-                    help=argparse.SUPPRESS)
+    # Changed-only (both spellings)
+    ap.add_argument("--changed-only", dest="changed_only", action="store_true", help="Ingest only files changed since base ref / last ingested SHA")
+    ap.add_argument("--changed_only",  dest="changed_only", action="store_true", help=argparse.SUPPRESS)
 
-    ap.add_argument("--base-ref", default=None,
-                    help="Git base ref for --changed-only (e.g., origin/main). If absent, uses repositories.last_ingested_sha when available.")
+    ap.add_argument("--base-ref", default=None, help="Git base ref for --changed-only (e.g., origin/main). If absent, uses repositories.last_ingested_sha when available.")
     ap.add_argument("--follow-symlinks", action="store_true")
-    ap.add_argument("--max-file-size", type=int, default=2_000_000,
-                    help="Skip files larger than this many bytes (default 2MB)")
+    ap.add_argument("--max-file-size", type=int, default=2_000_000, help="Skip files larger than this many bytes (default 2MB)")
 
     # Chunking/window config (chars ~= 4x tokens)
-    ap.add_argument("--window-max-chars", type=int, default=int(os.environ.get("WINDOW_MAX_CHARS", "1800")),
-                    help="Max chars per fallback window (default 1800 ≈ 450 tokens)")
-    ap.add_argument("--window-overlap-chars", type=int, default=int(os.environ.get("WINDOW_OVERLAP_CHARS", "300")),
-                    help="Overlap chars between fallback windows (default 300)")
+    ap.add_argument("--window-max-chars", type=int, default=int(os.environ.get("WINDOW_MAX_CHARS", "1800")), help="Max chars per fallback window (default 1800 ≈ 450 tokens)")
+    ap.add_argument("--window-overlap-chars", type=int, default=int(os.environ.get("WINDOW_OVERLAP_CHARS", "300")), help="Overlap chars between fallback windows (default 300)")
 
     # Embeddings
     ap.add_argument("--embed", action="store_true", help="Compute and store embeddings via Ollama")
-    ap.add_argument("--embed-model", default=os.environ.get("EMB_MODEL", "mxbai-embed-large"),
-                    help="Ollama embedding model (default from EMB_MODEL or mxbai-embed-large)")
-    ap.add_argument("--embed-max-chars", type=int, default=int(os.environ.get("EMB_MAX_CHARS", "2000")),
-                    help="Safety cap on text length sent to embed API (default 2000 chars)")
+    ap.add_argument("--embed-model", default=os.environ.get("EMB_MODEL", "mxbai-embed-large"), help="Ollama embedding model (default from EMB_MODEL or mxbai-embed-large)")
+    ap.add_argument("--embed-max-chars", type=int, default=int(os.environ.get("EMB_MAX_CHARS", "2000")), help="Safety cap on text length sent to embed API (default 2000 chars)")
 
     # Edges
     build_edges_default = os.environ.get("BUILD_EDGES", "1").strip() not in ("0", "false", "False", "")
-    ap.add_argument("--build-edges", dest="build_edges", action="store_true", default=build_edges_default,
-                    help="Build intra-file call edges (default: on) and run cross-file materializer")
-    ap.add_argument("--no-build-edges", dest="build_edges", action="store_false",
-                    help="Disable edges building")
+    ap.add_argument("--build-edges", dest="build_edges", action="store_true", default=build_edges_default, help="Build intra-file call edges (default: on) and run cross-file materializer")
+    ap.add_argument("--no-build-edges", dest="build_edges", action="store_false", help="Disable edges building")
+
+    # Report
+    report_default = os.environ.get("REPORT", "0").strip() in ("1", "true", "True")
+    ap.add_argument("--report", dest="report", action="store_true", default=report_default, help="Print read-only ingestion quality report (uses db/usefulSQL/useful_sql.sql if present)")
 
     args = ap.parse_args()
 
@@ -1000,7 +1056,7 @@ def main():
     log.info(
         f"Starting ingest: repo_name={args.repo_name} dir={repo_dir} "
         f"changed_only={bool(args.changed_only)} base_ref={base_ref or '<auto/none>'} "
-        f"embed={bool(args.embed)} model={args.embed_model} build_edges={args.build_edges}"
+        f"embed={bool(args.embed)} model={args.embed_model} build_edges={args.build_edges} report={bool(args.report)}"
     )
     if not TS_AVAILABLE:
         log.info("AST chunking disabled (no tree-sitter). Using windowed fallback as needed.")
@@ -1054,15 +1110,7 @@ def main():
             # derive module (for Java we may refine after chunks)
             module_guess = derive_module(root, fp, lang, None)
 
-            file_id = upsert_code_file(
-                cur,
-                repository_id=repo_id,
-                rel_path=rel_path,
-                language=lang,
-                size_bytes=size_bytes,
-                checksum=checksum,
-                module=module_guess,
-            )
+            file_id = upsert_code_file(cur, repository_id=repo_id, rel_path=rel_path, language=lang, size_bytes=size_bytes, checksum=checksum, module=module_guess)
 
             # Chunk
             if TS_AVAILABLE and lang in PARSER_BY_LANG:
@@ -1070,11 +1118,7 @@ def main():
             else:
                 log.debug(f"[fallback] {rel_path}")
 
-            chunks = make_chunks(
-                fp,
-                max_chars=args.window_max_chars,
-                overlap_chars=args.window_overlap_chars,
-            )
+            chunks = make_chunks(fp, max_chars=args.window_max_chars, overlap_chars=args.window_overlap_chars)
 
             if not chunks:
                 log.debug(f"[skip] {rel_path}: no chunks (unknown language or empty file)")
@@ -1095,21 +1139,13 @@ def main():
             name_to_chunks: Dict[str, List[Tuple[int, str, str]]] = {}
             chunk_ids_and_calls: List[Tuple[int, List[str], str]] = []
 
-            # Collect per-file imports from first chunk that has them; for fallback we may parse from file_text_for_checksum if needed
             file_level_imports = set()
             for c in chunks:
                 for imp in c.imports or []:
                     file_level_imports.add(imp)
 
             for c in chunks:
-                cid = upsert_code_chunk(
-                    cur,
-                    file_id=file_id,
-                    c=c,
-                    embed=args.embed,
-                    embed_model=args.embed_model,
-                    embed_max_chars=args.embed_max_chars,
-                )
+                cid = upsert_code_chunk(cur, file_id=file_id, c=c, embed=args.embed, embed_model=args.embed_model, embed_max_chars=args.embed_max_chars)
                 sname = simple_symbol_name(c.symbol_name)
                 name_to_chunks.setdefault(sname, []).append((cid, c.symbol_name, c.symbol_kind))
                 chunk_ids_and_calls.append((cid, c.calls or [], c.symbol_name))
@@ -1137,7 +1173,6 @@ def main():
                                 continue
                             insert_edge_if_absent(cur, src_id, dst_id, edge_type="calls", weight=1.0)
                             new_edges += 1
-
                 total_edges += new_edges
 
             log.info(f"[file] {rel_path}: chunks={len(chunks)} edges+={new_edges} bytes={size_bytes} lang={lang or 'unknown'}")
@@ -1162,6 +1197,19 @@ def main():
             except Exception as e:
                 conn.rollback()
                 log.warning(f"[cross-file] materialization failed: {e}")
+
+        # ------------------ Success Report (read-only) ------------------
+        if args.report:
+            # Prefer your repo file if it exists; else run the embedded quick report
+            sql_path = Path("db/usefulSQL/useful_sql.sql")
+            try:
+                used_file = run_sql_file_report(cur, sql_path)
+                if not used_file:
+                    run_quick_report(cur)
+            except Exception as e:
+                log.warning(f"[report] falling back to quick report: {e}")
+                run_quick_report(cur)
+        # ---------------------------------------------------------------
 
         log.info(f"[done] files={total_files} chunks={total_chunks} edges={total_edges} sha={head_sha or 'n/a'}")
     except Exception as e:
