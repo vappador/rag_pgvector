@@ -206,6 +206,18 @@ curl -X POST http://localhost:8000/ask/langgraph   -H "Content-Type: application
 
 ## 🔌 API Reference
 
+### API Endpoints Table
+
+| Method | Path              | Purpose                                  |
+|--------|------------------|------------------------------------------|
+| GET    | `/search`        | Hybrid retrieval (vector + lexical)      |
+| POST   | `/ask/strands`   | Ask a question via **Strands Agent**     |
+| POST   | `/ask/langgraph` | Ask a question via **LangGraph Agent**   |
+| GET    | `/graph/relations` | Show dependency relations for a file   |
+| GET    | `/graph/impact`    | Show impact analysis of a file change  |
+
+---
+
 ### `/search` (retrieval only)
 
 **Example**
@@ -278,6 +290,28 @@ curl -X POST http://localhost:8000/ask/langgraph   -H "Content-Type: application
   "engine": "langgraph",
   "answer": "JWT verification is implemented in ... [repo:path:line-range signature]"
 }
+```
+
+---
+
+### `/graph/relations`
+
+Explores dependency edges for a given file.
+
+Example:
+```bash
+curl "http://localhost:8000/graph/relations?repo=spring-petclinic&file=Person.java&direction=both&depth=2"
+```
+
+---
+
+### `/graph/impact`
+
+Shows files impacted by a file change.
+
+Example:
+```bash
+curl "http://localhost:8000/graph/impact?repo=spring-petclinic&file=Person.java&depth=2"
 ```
 
 ---
