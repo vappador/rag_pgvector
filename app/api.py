@@ -1,14 +1,23 @@
-# app/api.py
 import os
 from typing import Literal, Optional, Dict, Any, List
 
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 
+# --- Existing DB config ---
 DB_DSN = os.getenv("DB_DSN", "postgresql://rag:ragpwd@pg:5432/ragdb")
 
-app = FastAPI(title="RAG PGVector API", version="1.1.0")
+# --- LangGraph imports (keep the original demo alive) ---
+# We import lazily to avoid building graphs on module import.
+from langgraph.graph import StateGraph, START, END
+import ollama  # for the original langgraph demo
+
+# --- Strands agent wrapper (our new demo) ---
+from app.strands_agent import run_with_rate_limits
+
+app = FastAPI(title="RAG PGVector API", version="2.0.0")
 
 
 def _conn():
@@ -52,7 +61,6 @@ def _resolve_file(cur, repo_name: str, file_hint: str):
     if exact:
         return repo_id, repo_name_db, exact[0], exact[1]
 
-    # If the hint includes a slash, treat it as suffix; else treat as basename
     like = f"%/{file_hint.lstrip('/')}" if "/" in file_hint else f"%/{file_hint}"
     matches = _all(
         cur,
@@ -84,13 +92,7 @@ def _resolve_file(cur, repo_name: str, file_hint: str):
 
 
 def _edges_query(direction: Literal["in", "out"]) -> str:
-    """
-    Returns a parameterized SQL for directional traversal up to N hops.
-    Params expected at execution time (in order):
-      file_id, depth, repo_id, repo_id
-    """
     if direction == "out":
-        # Start from chunks in the target file as sources; walk forward
         return """
         WITH RECURSIVE start AS (
           SELECT id FROM rag.code_chunks
@@ -127,7 +129,6 @@ def _edges_query(direction: Literal["in", "out"]) -> str:
         ORDER BY ed.depth, sf.path, s.start_line, df.path;
         """
     else:
-        # "in": start from target as destinations; walk reverse (dependents)
         return """
         WITH RECURSIVE start AS (
           SELECT id FROM rag.code_chunks
@@ -164,6 +165,7 @@ def _edges_query(direction: Literal["in", "out"]) -> str:
         ORDER BY ed.depth, sf.path, s.start_line, df.path;
         """
 
+# ---------------------- Existing graph endpoints (unchanged) ------------------
 
 @app.get("/graph/relations")
 def graph_relations(
@@ -173,64 +175,50 @@ def graph_relations(
     depth: int = Query(2, ge=1, le=6, description="Traversal depth (hops)"),
     limit_edges: int = Query(5000, ge=1, le=20000, description="Safety cap on returned edges"),
 ):
-    """
-    Relationship graph around a file, with edges and a per-file summary.
-    - direction=out: dependencies (edges from file -> others)
-    - direction=in: dependents (edges to file <- others)
-    - direction=both: union of the two
-    """
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            repo_id, repo_name, file_id, file_path = _resolve_file(cur, repo, file)
+    with _conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        repo_id, repo_name, file_id, file_path = _resolve_file(cur, repo, file)
 
-            def run_dir(dirflag: Literal["in", "out"]) -> List[Dict[str, Any]]:
-                sql = _edges_query(dirflag)
-                rows = _all(cur, sql, (file_id, depth, repo_id, repo_id))
-                return rows[:limit_edges]
+        def run_dir(dirflag: Literal["in", "out"]) -> List[Dict[str, Any]]:
+            sql = _edges_query(dirflag)
+            rows = _all(cur, sql, (file_id, depth, repo_id, repo_id))
+            return rows[:limit_edges]
 
-            results: List[Dict[str, Any]] = []
-            if direction in ("out", "both"):
-                results.extend(run_dir("out"))
-            if direction in ("in", "both"):
-                results.extend(run_dir("in"))
+        results: List[Dict[str, Any]] = []
+        if direction in ("out", "both"):
+            results.extend(run_dir("out"))
+        if direction in ("in", "both"):
+            results.extend(run_dir("in"))
 
-            # Summaries
-            files_summary: Dict[str, int] = {}
-            counts_by_relation: Dict[str, int] = {}
-            for r in results:
-                counts_by_relation[r["relation"]] = counts_by_relation.get(r["relation"], 0) + 1
-                for path in (r["src_path"], r["dst_path"]):
-                    if path == file_path:
-                        continue
-                    files_summary[path] = min(files_summary.get(path, 999), r["depth"])
+        files_summary: Dict[str, int] = {}
+        counts_by_relation: Dict[str, int] = {}
+        for r in results:
+            counts_by_relation[r["relation"]] = counts_by_relation.get(r["relation"], 0) + 1
+            for path in (r["src_path"], r["dst_path"]):
+                if path == file_path:
+                    continue
+                files_summary[path] = min(files_summary.get(path, 999), r["depth"])
 
-            affected = [{"path": p, "min_depth": d} for p, d in sorted(files_summary.items(), key=lambda x: (x[1], x[0]))]
+        affected = [{"path": p, "min_depth": d} for p, d in sorted(files_summary.items(), key=lambda x: (x[1], x[0]))]
 
-            return {
-                "repo": repo_name,
-                "target": {"file_id": file_id, "path": file_path},
-                "direction": direction,
-                "depth": depth,
-                "edge_count": len(results),
-                "counts_by_relation": counts_by_relation,
-                "affected_files": affected,
-                "edges": results,  # each has: depth, relation, src/dst chunk+file+symbol
-            }
+        return {
+            "repo": repo_name,
+            "target": {"file_id": file_id, "path": file_path},
+            "direction": direction,
+            "depth": depth,
+            "edge_count": len(results),
+            "counts_by_relation": counts_by_relation,
+            "affected_files": affected,
+            "edges": results,
+        }
 
 
 def _impact_sql() -> str:
-    """
-    Parameterized SQL for "impact" view (dependents + imports + lexical).
-    Params expected at execution (in order):
-      file_id, depth, repo_id, repo_id, import_like, repo_id, lexical_token, token_label, token_label, file_id, limit_files
-    """
     return """
     WITH RECURSIVE
     start AS (
       SELECT id FROM rag.code_chunks
       WHERE file_id = %s AND valid_to IS NULL
     ),
-    -- chunks that point to the target file's chunks
     direct_dep AS (
       SELECT DISTINCT e.src_chunk_id, 1 AS depth, e.relation
       FROM rag.chunk_edges e
@@ -313,62 +301,209 @@ def graph_impact(
     include_edges: bool = Query(True, description="Also include raw 'in' edges used for impact?"),
     limit_edges: int = Query(5000, ge=1, le=20000, description="Safety cap on returned edges"),
 ):
+    with _conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        repo_id, repo_name, file_id, file_path = _resolve_file(cur, repo, file)
+        if not token:
+            base = os.path.basename(file_path)
+            token = base.split(".", 1)[0] if "." in base else base
+        import_like = f"%{token}%"
+
+        sql = _impact_sql()
+        rows = _all(
+            cur,
+            sql,
+            (
+                file_id,
+                depth,
+                repo_id,
+                repo_id,
+                import_like,
+                repo_id,
+                token,
+                token,
+                token,
+                file_id,
+                limit_files,
+            ),
+        )
+
+        result: Dict[str, Any] = {
+            "repo": repo_name,
+            "target": {"file_id": file_id, "path": file_path},
+            "depth": depth,
+            "token": token,
+            "affected_files": rows,
+        }
+
+        if include_edges:
+            e_sql = _edges_query("in")
+            edges = _all(cur, e_sql, (file_id, depth, repo_id, repo_id))
+            result["edges"] = edges[:limit_edges]
+
+            counts: Dict[str, int] = {}
+            for e in result["edges"]:
+                counts[e["relation"]] = counts.get(e["relation"], 0) + 1
+            result["counts_by_relation"] = counts
+
+        return result
+
+# -------------------------- Ask endpoints: Strands vs LangGraph ---------------
+
+class AskIn(BaseModel):
+    question: str
+
+@app.post("/ask/strands")
+def ask_strands(payload: AskIn):
     """
-    Impact view: given a file, list files likely affected if it changes.
-    Combines:
-      - graph dependents (1..depth hops)
-      - import refs mentioning the token
-      - lexical references to the token (tsvector)
+    Uses Strands Agent + Postgres retriever tool.
+    Honors RL_* env vars for basic rate limiting.
     """
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            repo_id, repo_name, file_id, file_path = _resolve_file(cur, repo, file)
+    user_prompt = (
+        "Answer the user's question using repository context.\n"
+        "If needed, call the `retrieve_context` tool with the question text to gather relevant code.\n"
+        f"User question:\n{payload.question}"
+    )
+    answer = run_with_rate_limits(user_prompt)
+    return {"engine": "strands", "answer": answer}
 
-            # Default token from basename without extension, e.g., "Person" for "Person.java"
-            if not token:
-                base = os.path.basename(file_path)
-                token = base.split(".", 1)[0] if "." in base else base
+# ------- LangGraph adapter (minimal): reuse your original retrieve/generate ----
 
-            # Compose params
-            import_like = f"%{token}%"
+# We mirror the original State and nodes inline so we don't rely on side effects
+from typing import TypedDict
+import time as _time
 
-            sql = _impact_sql()
-            rows = _all(
-                cur,
-                sql,
-                (
-                    file_id,              # start.file_id
-                    depth,                # dep depth
-                    repo_id,              # dep_files filter
-                    repo_id,              # import_refs repo
-                    import_like,          # import text LIKE
-                    repo_id,              # lex_refs repo
-                    token,                # lexical token
-                    token,                # label for imports
-                    token,                # label for lexical
-                    file_id,              # exclude target file
-                    limit_files,          # LIMIT
+class LGState(TypedDict):
+    question: str
+    context: str
+    answer: str
+
+EMB_MODEL = os.getenv("EMB_MODEL", "mxbai-embed-large:latest")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama3.1:8b")
+OLLAMA_BASE = os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+_ollama = ollama.Client(host=OLLAMA_BASE)
+
+def _norm_model(s: str) -> str:
+    s = (s or "").strip()
+    return s if ":" in s else f"{s}:latest"
+
+def _as_vector_literal(vec):
+    return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+
+SYS = (
+    "You are a senior code assistant. Use the provided repository context strictly.\n"
+    "Cite file/line provenance already included in the context comments. If context is insufficient, say so briefly."
+)
+
+def _retrieve(state: LGState) -> LGState:
+    q = state["question"]
+    res = _ollama.embeddings(model=_norm_model(EMB_MODEL), prompt=q)
+    q_emb = res["embedding"]
+    q_emb_lit = _as_vector_literal(q_emb)
+
+    with psycopg2.connect(DB_DSN) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SET LOCAL statement_timeout = '15000ms';")
+        try:
+            sql = """
+                WITH q AS (
+                  SELECT %s::vector AS emb,
+                         plainto_tsquery('simple', unaccent(%s)) AS tsq,
+                         %s AS qraw
                 ),
-            )
+                scored AS (
+                  SELECT
+                    v.id, v.repo_name, v.path, v.language,
+                    v.symbol_name, v.symbol_kind, v.symbol_signature,
+                    v.start_line, v.end_line, v.content,
+                    1 - (v.embedding <=> (SELECT emb FROM q)) AS vec_score,
+                    ts_rank_cd(v.content_tsv, (SELECT tsq FROM q)) AS lex_score
+                  FROM rag.v_chunk_search v
+                  WHERE ( (SELECT tsq FROM q) @@ v.content_tsv OR (SELECT emb FROM q) IS NOT NULL )
+                )
+                SELECT *, (0.7*vec_score + 0.3*lex_score) AS s
+                FROM scored
+                ORDER BY s DESC
+                LIMIT 12;
+            """
+            cur.execute(sql, (q_emb_lit, q, q))
+        except psycopg2.Error:
+            sql = """
+                WITH q AS (
+                  SELECT %s::vector AS emb,
+                         plainto_tsquery('simple', %s) AS tsq,
+                         %s AS qraw
+                ),
+                scored AS (
+                  SELECT
+                    v.id, v.repo_name, v.path, v.language,
+                    v.symbol_name, v.symbol_kind, v.symbol_signature,
+                    v.start_line, v.end_line, v.content,
+                    1 - (v.embedding <=> (SELECT emb FROM q)) AS vec_score,
+                    ts_rank_cd(v.content_tsv, (SELECT tsq FROM q)) AS lex_score
+                  FROM rag.v_chunk_search v
+                  WHERE ( (SELECT tsq FROM q) @@ v.content_tsv OR (SELECT emb FROM q) IS NOT NULL )
+                )
+                SELECT *, (0.7*vec_score + 0.3*lex_score) AS s
+                FROM scored
+                ORDER BY s DESC
+                LIMIT 12;
+            """
+            cur.execute(sql, (q_emb_lit, q, q))
+        rows = cur.fetchall()
 
-            result: Dict[str, Any] = {
-                "repo": repo_name,
-                "target": {"file_id": file_id, "path": file_path},
-                "depth": depth,
-                "token": token,
-                "affected_files": rows,
-            }
+    if not rows:
+        stitched = "// No results found for the question."
+    else:
+        stitched = "\n\n".join(
+            f"// {r['repo_name']}:{r['path']}:{r['start_line']}-{r['end_line']} "
+            f"[{r['symbol_signature'] or r['symbol_name'] or ''}]\n{r['content']}"
+            for r in rows
+        )
+    state["context"] = stitched
+    return state
 
-            if include_edges:
-                # Provide raw 'in' direction edges used for dependents
-                e_sql = _edges_query("in")
-                edges = _all(cur, e_sql, (file_id, depth, repo_id, repo_id))
-                result["edges"] = edges[:limit_edges]
+def _generate_answer(state: LGState) -> LGState:
+    ctx = state["context"]
+    q = state["question"]
+    prompt = f"{SYS}\n\nContext:\n{ctx}\n\nUser question:\n{q}\n\nAnswer:"
+    content_parts = []
+    try:
+        stream = _ollama.chat(
+            model=_norm_model(LLM_MODEL),
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.2},
+            stream=True,
+        )
+        for chunk in stream:
+            token = chunk.get("message", {}).get("content", "")
+            if token:
+                content_parts.append(token)
+    except Exception as e:
+        content_parts.append(f"LLM failure: {e}")
+    state["answer"] = "".join(content_parts).strip()
+    return state
 
-                # Quick counts by relation
-                counts: Dict[str, int] = {}
-                for e in result["edges"]:
-                    counts[e["relation"]] = counts.get(e["relation"], 0) + 1
-                result["counts_by_relation"] = counts
+def _build_langgraph_app():
+    g = StateGraph(LGState)
+    g.add_node("retrieve", _retrieve)
+    g.add_node("generate_answer", _generate_answer)
+    g.add_edge(START, "retrieve")
+    g.add_edge("retrieve", "generate_answer")
+    g.add_edge("generate_answer", END)
+    return g.compile()
 
-            return result
+_langgraph_app = None
+
+def get_langgraph_app():
+    global _langgraph_app
+    if _langgraph_app is None:
+        _langgraph_app = _build_langgraph_app()
+    return _langgraph_app
+
+@app.post("/ask/langgraph")
+def ask_langgraph(payload: AskIn):
+    """
+    Uses the original LangGraph-style pipeline.
+    """
+    app_ = get_langgraph_app()
+    out = app_.invoke({"question": payload.question, "context": "", "answer": ""})
+    return {"engine": "langgraph", "answer": (out.get("answer") or "").strip()}

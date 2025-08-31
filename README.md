@@ -5,7 +5,9 @@ Local, production-ready Retrieval-Augmented Generation (RAG) for **code reposito
 - **Postgres 16 + pgvector** for hybrid retrieval (vector + lexical + symbol boosts)
 - **Tree-sitter** for AST-aware chunking (function/class-level)
 - **Ollama** (local) for **embeddings** and **chat**
-- **FastAPI** retrieval service + a tiny **LangGraph** agent
+- **FastAPI** retrieval service with:
+  - a **LangGraph**-based agent
+  - a modern **Strands**-based agent (with rate limiting, observability, and tool APIs)
 
 ---
 
@@ -15,17 +17,17 @@ Local, production-ready Retrieval-Augmented Generation (RAG) for **code reposito
 - **Hybrid search**: vector similarity + BM25/tsvector + symbol/name boosts
 - **Local-only models**: embeddings via Ollama’s `mxbai-embed-large` (1024-dim), chat via `llama3.1:8b`
 - **Simple ingestion**: clone/parse/chunk/embed/index
-- **Agent**: minimal graph that retrieves & answers with stitched, provenance-rich context
+- **Agents**:  
+  - **LangGraph Agent**: minimal graph that retrieves & answers with stitched, provenance-rich context  
+  - **Strands Agent**: production-ready with **rate limits**, **tooling**, and **observability**
 
 ---
 
-##  Repository layout
+## Repository layout
 
 ```
 rag-pgvector/
 ├─ Dockerfile
-├─ .dockerignore
-├─ .gitignore
 ├─ docker-compose.yml
 ├─ .env.example
 ├─ db/
@@ -34,14 +36,15 @@ rag-pgvector/
 │  ├─ requirements.txt
 │  ├─ db.py
 │  ├─ ingest.py
-│  ├─ api.py
-│  └─ agent_graph.py
-└─ Makefile           # optional, not required by the compose flows
+│  ├─ api.py              # unified API (search, graph, ask endpoints)
+│  ├─ agent_graph.py      # LangGraph demo agent
+│  └─ strands_agent.py    # Strands demo agent
+└─ Makefile
 ```
 
 ---
 
-##  Architecture (high-level)
+## Architecture (high-level)
 
 ```mermaid
 flowchart LR
@@ -63,19 +66,54 @@ flowchart LR
     I --> J[Context Stitch]
   end
 
-  subgraph Agent
+  subgraph Agents
     K[LangGraph Agent] -->|calls| G
     J --> K
     K --> L["Ollama Chat (llama3.1:8b)"]
+
+    M[Strands Agent] -->|Tool: retrieve_context| F
+    F --> M
+    M --> N["Ollama Chat (llama3.1:8b)"]
   end
 
 classDef git fill:#f0f8ff,stroke:#7aa,stroke-width:1px;
-
 ```
 
 ---
 
-##  Prerequisites
+## LangGraph vs Strands (at a glance)
+
+```mermaid
+flowchart TB
+  subgraph LangGraph
+    LG1([StateGraph])
+    LG2[retrieve node]
+    LG3[generate_answer node]
+    LG1 --> LG2 --> LG3
+    LG3 --> LG4[(Ollama Chat)]
+    LG2 --> LG5[(Postgres + pgvector)]
+  end
+
+  subgraph Strands
+    ST1([Agent Loop])
+    ST2{{Tool: retrieve_context}}
+    ST1 -->|decides tool use| ST2
+    ST2 --> ST5[(Postgres + pgvector)]
+    ST1 --> ST4[(Ollama Chat)]
+    ST1 --> ST6[(Observability + Rate Limits)]
+  end
+```
+
+**Key differences**
+
+- **Control flow**: LangGraph uses explicit nodes/edges; Strands uses an agent loop that calls tools as needed.  
+- **Retrieval**: In LangGraph, retrieval is a node; in Strands, retrieval is a **Tool** the model can invoke.  
+- **Ops features**: Strands sample includes basic **rate limits** (RPM/TPM/concurrency) and **metrics** hooks.  
+- **Both** share the same Postgres+pgvector hybrid query and Ollama models.
+
+---
+
+## Prerequisites
 
 - Docker & Docker Compose
 - (Optional) Native Ollama on host if you don’t want the containerized Ollama
@@ -85,54 +123,61 @@ classDef git fill:#f0f8ff,stroke:#7aa,stroke-width:1px;
 
 ## ⚙️ Configuration
 
-Copy and edit environment variables as needed:
+All runtime knobs are environment-driven.
 
 ```bash
 cp .env.example .env
 ```
 
-Key envs (can also be set inline or in compose):
-- `DB_DSN`: `postgresql://rag:ragpwd@pg:5432/ragdb`
-- `OLLAMA_BASE_URL`: `http://ollama:11434` (or `http://host.docker.internal:11434` to use host’s Ollama)
-- `EMB_MODEL`: `mxbai-embed-large` (1024-dim)
-- `EMB_DIM`: `1024`
-- `LLM_MODEL`: `llama3.1:8b`
+Key variables in `.env`:
+
+```env
+# Models
+EMB_MODEL=mxbai-embed-large:latest
+LLM_MODEL=llama3.1:8b
+EMB_DIM=1024
+
+# Strands Agent
+STRANDS_TEMPERATURE=0.2
+STRANDS_MAX_TOKENS=2048
+
+# Strands Rate Limits
+RL_MAX_CONCURRENCY=2
+RL_RPM=60
+RL_TPM=100000
+
+# Logging
+LOG_LEVEL=INFO
+LOG_PREVIEW_CHARS=240
+
+# Postgres DSN
+DB_DSN=postgresql://rag:ragpwd@pg:5432/ragdb
+
+# Ollama endpoint
+OLLAMA_HOST=http://ollama:11434
+OLLAMA_BASE_URL=http://ollama:11434
+```
 
 > **Note on dimensions:** The DB schema sets `embedding vector(1024)`. If you use a different embedding model (e.g., 768-dim), update both the env and DB column type accordingly (see “Changing embedding dimension” below).
 
 ---
 
-##  Quickstart
+## Quickstart
 
-### 1) Bring up core services (Postgres + Ollama + API)
+### 1) Bring up core services
 
 ```bash
 docker compose up -d pg ollama
-# initialize schema (one-shot)
 docker compose --profile init up migrate
-# start the API service
 docker compose up -d app
 ```
 
-This will:
-- Start Postgres with pgvector
-- Start Ollama (empty cache initially)
-- Run the schema migration
-- Start the FastAPI retrieval service on `http://localhost:8000`
-
 ### 2) Pull models into Ollama
 
-In another terminal:
-
 ```bash
-# Embedding model (matches 1024-d schema)
 docker exec -it ollama ollama pull mxbai-embed-large
-
-# Chat model for the agent (choose as you like)
 docker exec -it ollama ollama pull llama3.1:8b
 ```
-
-> If using host Ollama, run `ollama pull ...` on your host instead.
 
 ### 3) Ingest repositories
 
@@ -141,39 +186,49 @@ REPO_URLS="https://github.com/expressjs/express.git,https://github.com/spring-pr
 docker compose --profile ingest up --exit-code-from ingest ingest
 ```
 
-This clones, parses, chunks, embeds, and indexes code into Postgres.
-
 ### 4) Try the retrieval API
 
 ```bash
 curl "http://localhost:8000/search?q=jwt%20verification&language=java"
 ```
 
-You’ll get:
-- `results[]` (top chunks with repo/path/lines/symbols/scores)
-- `stitched_context` (ready to inject into prompts)
+### 5) Run the agents
 
-### 5) Run the tiny agent locally
+- **LangGraph CLI demo**
 
 ```bash
 docker compose exec app python /workspace/app/agent_graph.py
-# Then type a question, e.g., "Where is JWT verification implemented?"
+```
+
+- **Strands API demo**
+
+```bash
+curl -X POST http://localhost:8000/ask/strands \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Where is JWT verification implemented?"}'
+```
+
+- **LangGraph API demo**
+
+```bash
+curl -X POST http://localhost:8000/ask/langgraph \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Where is JWT verification implemented?"}'
 ```
 
 ---
 
 ## 🔌 API Reference
 
-`GET /search`
+### `/search` (retrieval only)
 
-**Query params**
-- `q` *(required)*: user query (natural language or symbol)
-- `repo` *(optional)*: restrict to a single repo name
-- `language` *(optional)*: `typescript` | `javascript` | `java`
-- `top_k` *(default 12)*
-- `w_vec`, `w_lex`, `w_sym`: weights for hybrid scoring (defaults `0.65/0.25/0.10`)
+**Example**
 
-**Response**
+```bash
+curl "http://localhost:8000/search?q=jwt%20verification&language=java"
+```
+
+**Response (abridged)**
 ```json
 {
   "results": [
@@ -195,12 +250,66 @@ docker compose exec app python /workspace/app/agent_graph.py
 }
 ```
 
-**How to use in agents**  
-Inject `stitched_context` into the system/context section of your prompt. The agent can cite provenance that’s already embedded as comments (`repo:path:start-end`).
+---
+
+### `/ask/strands`
+
+**POST body**
+```json
+{ "question": "Where is JWT verification implemented?" }
+```
+
+**curl**
+```bash
+curl -X POST http://localhost:8000/ask/strands \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Where is JWT verification implemented?"}'
+```
+
+**Response (example)**
+```json
+{
+  "engine": "strands",
+  "answer": "JWT verification is implemented in ... [repo:path:line-range signature]"
+}
+```
 
 ---
 
-##  Schema Overview
+### `/ask/langgraph`
+
+**POST body**
+```json
+{ "question": "Where is JWT verification implemented?" }
+```
+
+**curl**
+```bash
+curl -X POST http://localhost:8000/ask/langgraph \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Where is JWT verification implemented?"}'
+```
+
+**Response (example)**
+```json
+{
+  "engine": "langgraph",
+  "answer": "JWT verification is implemented in ... [repo:path:line-range signature]"
+}
+```
+
+---
+
+## 🧠 Strands Features
+
+- **Rate limiting** (RPM, TPM, concurrency) via `.env`
+- **Observability** via `strands.observability.get_metrics()`
+- **Tools**: retrieval is registered as a Strands tool (`retrieve_context`)
+- **System prompt** ensures provenance is cited inline
+
+---
+
+## Schema Overview
 
 **Tables**
 - `rag.repositories` ⇒ one per repo
@@ -218,7 +327,7 @@ Inject `stitched_context` into the system/context section of your prompt. The ag
 
 ---
 
-##  Retrieval Strategy (Hybrid)
+## Retrieval Strategy (Hybrid)
 
 - **Vector**: cosine similarity on pgvector (query embedded via Ollama)
 - **Lexical**: `ts_rank_cd` over a `simple` + `unaccent` tsvector of code text
@@ -229,11 +338,11 @@ Tuning knobs are exposed via query params (`w_vec`, `w_lex`, `w_sym`, `top_k`).
 
 ---
 
-##  Changing embedding dimension (if you use another model)
+## Changing embedding dimension (if you use another model)
 
 Current schema assumes **1024-dim** (`mxbai-embed-large`). To switch:
 
-1) Choose a new Ollama embedding model (e.g., `nomic-embed-text` at 768-dim).
+1) Choose a new Ollama embedding model (e.g., `nomic-embed-text` at 768-dim).  
 2) Update env:
    ```
    EMB_MODEL=nomic-embed-text
@@ -256,9 +365,9 @@ Current schema assumes **1024-dim** (`mxbai-embed-large`). To switch:
 
 ---
 
-##  Production Hardening
+## Production Hardening
 
-- Put **auth** (API keys/JWT) in front of `/search`
+- Put **auth** (API keys/JWT) in front of `/search` and `/ask/*`
 - Use **read-only DB roles** for the API
 - Enable **SSL** for Postgres (or run inside a trusted network)
 - Add **webhook/cron ingestion**, **idempotent staging**, **soft-deletes**, and **partitioning** for very large repos
@@ -266,7 +375,7 @@ Current schema assumes **1024-dim** (`mxbai-embed-large`). To switch:
 
 ---
 
-##  Troubleshooting
+## Troubleshooting
 
 - **“dimension mismatch” / `cannot convert 1024-d to 768-d`**  
   Your embedding model dimension and `vector(N)` must match. See **Changing embedding dimension**.
@@ -291,60 +400,46 @@ Current schema assumes **1024-dim** (`mxbai-embed-large`). To switch:
 
 ---
 
-## 🧠 Using with Strands (agentic)
-
-- Register the retrieval endpoint as a **tool** your Strands agent can call:
-  ```
-  GET http://<host>:8000/search?q={user_query}
-  ```
-- Inject `stitched_context` into the agent’s system/context.
-- Optional: pass `language`, `repo` based on task context to reduce noise.
-
----
-
 ## License
 
-Choose a license (e.g., MIT) and add it as `LICENSE`. If unsure, MIT is a good default for open source templates.
+MIT (suggested)
 
 ---
 
-##  Contributing
-
-Issues and PRs welcome!
-- Add language parsers (Python/Go/etc.)
-- Improve AST extraction (use tree-sitter queries per language)
-- Add PR preview indexes and diff-driven ingestion
-- Add HNSW index path & benchmarks
-
----
-
-##  Commands Reference
+## Commands Reference
 
 ```bash
-#Build the app locally, so that the tag exists
+# Build app
 docker compose build app
 
-# Start Postgres + Ollama, pull models into ollama
+# Start DB + Ollama
 docker compose up -d pg ollama
 docker compose --profile init run --rm ollama-init
 
-# Run migration once to create db with tables extension etc
+# Run migration
 docker compose --profile init run --rm migrate
 
 # Start API
 docker compose up -d app
 
-# Pull models into Ollama (containerized)
+# Pull models into Ollama
 docker exec -it ollama ollama pull mxbai-embed-large
 docker exec -it ollama ollama pull llama3.1:8b
 
-# Ingest repos (one-shot)
-REPO_URLS="https://github.com/expressjs/express.git,https://github.com/spring-projects/spring-petclinic.git" \
+# Ingest repos
+REPO_URLS="https://github.com/expressjs/express.git" \
 docker compose --profile ingest up --exit-code-from ingest ingest
 
 # Test search
 curl "http://localhost:8000/search?q=jwt%20verification&language=java"
 
-# Run the mini agent
-docker compose exec app python /workspace/app/agent_graph.py
+# Test Strands Agent
+curl -X POST http://localhost:8000/ask/strands \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Where is JWT verification implemented?"}'
+
+# Test LangGraph Agent
+curl -X POST http://localhost:8000/ask/langgraph \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Where is JWT verification implemented?"}'
 ```

@@ -1,11 +1,23 @@
+# Web API
 fastapi==0.112.2
 uvicorn[standard]==0.30.6
+python-dotenv==1.0.1
+requests>=2.31.0
+
+# Postgres & misc
 psycopg2-binary==2.9.9
 GitPython==3.1.43
 tqdm==4.66.5
 numpy==1.26.4
+
+# Code parsing (if you need them elsewhere)
 tree_sitter==0.20.2
 tree_sitter_languages==1.10.2
+
+# --- Keep LangGraph demo alive ---
 langgraph==0.2.35
 ollama>=0.2.0
-python-dotenv==1.0.1
+
+# --- Add Strands stack ---
+strands-agents[ollama]==1.6.0
+strands-agents-tools>=0.1.0

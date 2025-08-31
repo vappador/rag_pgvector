@@ -42,7 +42,7 @@ services:
       ollama:
         condition: service_healthy
     environment:
-      EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large}
+      EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large:latest}
       LLM_MODEL: ${LLM_MODEL:-llama3.1:8b}
     entrypoint: ["/bin/sh", "-lc"]
     command: |
@@ -89,15 +89,31 @@ services:
       ollama:
         condition: service_healthy
     environment:
+      # --- Database ---
       DB_DSN: postgresql://rag:ragpwd@pg:5432/ragdb
-      # Point the app at the Ollama HTTP API (not the unix socket)
+
+      # --- Ollama HTTP endpoint (in-container) ---
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_BASE_URL: http://ollama:11434
-      # Use explicit tags to avoid mismatches with /api/tags responses
+
+      # --- Models (explicit tags recommended) ---
       EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large:latest}
       EMB_DIM: "1024"
       LLM_MODEL: ${LLM_MODEL:-llama3.1:8b}
+
+      # --- Strands agent knobs (for /ask/strands) ---
+      STRANDS_TEMPERATURE: ${STRANDS_TEMPERATURE:-0.2}
+      STRANDS_MAX_TOKENS: ${STRANDS_MAX_TOKENS:-2048}
+
+      # --- Simple app-side rate limits for Strands agent ---
+      RL_MAX_CONCURRENCY: ${RL_MAX_CONCURRENCY:-2}
+      RL_RPM: ${RL_RPM:-60}
+      RL_TPM: ${RL_TPM:-100000}
+
+      # --- Logging ---
       PYTHONUNBUFFERED: "1"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_PREVIEW_CHARS: ${LOG_PREVIEW_CHARS:-240}
     ports:
       - "8000:8000"
     volumes:
@@ -122,7 +138,7 @@ services:
     environment:
       DB_DSN: postgresql://rag:ragpwd@pg:5432/ragdb
       OLLAMA_BASE_URL: http://ollama:11434
-      EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large}
+      EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large:latest}
       EMB_DIM: "1024"
       REPO_URLS: ${REPO_URLS:-}
     volumes:
