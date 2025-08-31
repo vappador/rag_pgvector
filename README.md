@@ -2,24 +2,24 @@
 
 Local, production-ready Retrieval-Augmented Generation (RAG) for **code repositories** (TypeScript, Java, Node.js) using:
 
-- **Postgres 16 + pgvector** for hybrid retrieval (vector + lexical + symbol boosts)
-- **Tree-sitter** for AST-aware chunking (function/class-level)
-- **Ollama** (local) for **embeddings** and **chat**
+- **Postgres 16 + pgvector** for hybrid retrieval (vector + lexical + symbol boosts)  
+- **Tree-sitter** for AST-aware chunking (function/class-level)  
+- **Ollama** (local) for **embeddings** and **chat**  
 - **FastAPI** retrieval service with:
-  - a **LangGraph**-based agent
-  - a modern **Strands**-based agent (with rate limiting, observability, and tool APIs)
+  - a **LangGraph**-based agent  
+  - a modern **Strands**-based agent (with rate limiting, observability, and tool APIs)  
 
 ---
 
 ## What you get
 
-- **Clean schema** for repos → files → code chunks (+ AST metadata)
-- **Hybrid search**: vector similarity + BM25/tsvector + symbol/name boosts
-- **Local-only models**: embeddings via Ollama’s `mxbai-embed-large` (1024-dim), chat via `llama3.1:8b`
-- **Simple ingestion**: clone/parse/chunk/embed/index
+- **Clean schema** for repos → files → code chunks (+ AST metadata)  
+- **Hybrid search**: vector similarity + BM25/tsvector + symbol/name boosts  
+- **Local-only models**: embeddings via Ollama’s `mxbai-embed-large` (1024-dim), chat via `llama3.1:8b`  
+- **Simple ingestion**: clone/parse/chunk/embed/index  
 - **Agents**:  
   - **LangGraph Agent**: minimal graph that retrieves & answers with stitched, provenance-rich context  
-  - **Strands Agent**: production-ready with **rate limits**, **tooling**, and **observability**
+  - **Strands Agent**: production-ready with **rate limits**, **tooling**, and **observability**  
 
 ---
 
@@ -104,20 +104,11 @@ flowchart TB
   end
 ```
 
-**Key differences**
-
+**Key differences**  
 - **Control flow**: LangGraph uses explicit nodes/edges; Strands uses an agent loop that calls tools as needed.  
 - **Retrieval**: In LangGraph, retrieval is a node; in Strands, retrieval is a **Tool** the model can invoke.  
-- **Ops features**: Strands sample includes basic **rate limits** (RPM/TPM/concurrency) and **metrics** hooks.  
-- **Both** share the same Postgres+pgvector hybrid query and Ollama models.
-
----
-
-## Prerequisites
-
-- Docker & Docker Compose
-- (Optional) Native Ollama on host if you don’t want the containerized Ollama
-- Ports available: `5432` (Postgres), `11434` (Ollama), `8000` (API)
+- **Ops features**: Strands sample includes **rate limits** and **metrics** hooks.  
+- **Both** share the same Postgres+pgvector hybrid query and Ollama models.  
 
 ---
 
@@ -182,8 +173,7 @@ docker exec -it ollama ollama pull llama3.1:8b
 ### 3) Ingest repositories
 
 ```bash
-REPO_URLS="https://github.com/expressjs/express.git,https://github.com/spring-projects/spring-petclinic.git" \
-docker compose --profile ingest up --exit-code-from ingest ingest
+REPO_URLS="https://github.com/expressjs/express.git,https://github.com/spring-projects/spring-petclinic.git" docker compose --profile ingest up --exit-code-from ingest ingest
 ```
 
 ### 4) Try the retrieval API
@@ -203,17 +193,13 @@ docker compose exec app python /workspace/app/agent_graph.py
 - **Strands API demo**
 
 ```bash
-curl -X POST http://localhost:8000/ask/strands \
-  -H "Content-Type: application/json" \
-  -d '{"question":"Where is JWT verification implemented?"}'
+curl -X POST http://localhost:8000/ask/strands   -H "Content-Type: application/json"   -d '{"question":"Where is JWT verification implemented?"}'
 ```
 
 - **LangGraph API demo**
 
 ```bash
-curl -X POST http://localhost:8000/ask/langgraph \
-  -H "Content-Type: application/json" \
-  -d '{"question":"Where is JWT verification implemented?"}'
+curl -X POST http://localhost:8000/ask/langgraph   -H "Content-Type: application/json"   -d '{"question":"Where is JWT verification implemented?"}'
 ```
 
 ---
@@ -261,9 +247,7 @@ curl "http://localhost:8000/search?q=jwt%20verification&language=java"
 
 **curl**
 ```bash
-curl -X POST http://localhost:8000/ask/strands \
-  -H "Content-Type: application/json" \
-  -d '{"question":"Where is JWT verification implemented?"}'
+curl -X POST http://localhost:8000/ask/strands   -H "Content-Type: application/json"   -d '{"question":"Where is JWT verification implemented?"}'
 ```
 
 **Response (example)**
@@ -285,9 +269,7 @@ curl -X POST http://localhost:8000/ask/strands \
 
 **curl**
 ```bash
-curl -X POST http://localhost:8000/ask/langgraph \
-  -H "Content-Type: application/json" \
-  -d '{"question":"Where is JWT verification implemented?"}'
+curl -X POST http://localhost:8000/ask/langgraph   -H "Content-Type: application/json"   -d '{"question":"Where is JWT verification implemented?"}'
 ```
 
 **Response (example)**
@@ -302,37 +284,37 @@ curl -X POST http://localhost:8000/ask/langgraph \
 
 ## 🧠 Strands Features
 
-- **Rate limiting** (RPM, TPM, concurrency) via `.env`
-- **Observability** via `strands.observability.get_metrics()`
-- **Tools**: retrieval is registered as a Strands tool (`retrieve_context`)
-- **System prompt** ensures provenance is cited inline
+- **Rate limiting** (RPM, TPM, concurrency) via `.env`  
+- **Observability** via `strands.observability.get_metrics()`  
+- **Tools**: retrieval is registered as a Strands tool (`retrieve_context`)  
+- **System prompt** ensures provenance is cited inline  
 
 ---
 
 ## Schema Overview
 
 **Tables**
-- `rag.repositories` ⇒ one per repo
-- `rag.commits` ⇒ commit metadata
-- `rag.files` ⇒ file metadata (language, size, test flag)
+- `rag.repositories` ⇒ one per repo  
+- `rag.commits` ⇒ commit metadata  
+- `rag.files` ⇒ file metadata (language, size, test flag)  
 - `rag.code_chunks` ⇒ **the core**: function/class or windowed chunks  
-  - content, `embedding vector(1024)`, `content_tsv` (lexical), `symbol_name`, `symbol_kind`, `symbol_signature`, `doc_comment`, `imports JSONB`, `calls JSONB`, `committed_at`, `valid_from`, `valid_to`
-- `rag.chunk_edges` ⇒ optional relations (`calls`, `imports`, `implements`, `tests`)
-- `rag.v_chunk_search` ⇒ view joining chunks ↔ files ↔ repos
+  - content, `embedding vector(1024)`, `content_tsv` (lexical), `symbol_name`, `symbol_kind`, `symbol_signature`, `doc_comment`, `imports JSONB`, `calls JSONB`, `committed_at`, `valid_from`, `valid_to`  
+- `rag.chunk_edges` ⇒ optional relations (`calls`, `imports`, `implements`, `tests`)  
+- `rag.v_chunk_search` ⇒ view joining chunks ↔ files ↔ repos  
 
 **Indexes**
-- `GIN(content_tsv)` for lexical/BM25
-- `IVFFLAT` on `embedding` (cosine) for ANN
-- btree on symbol fields and GIN on JSONB `imports`/`calls`
+- `GIN(content_tsv)` for lexical/BM25  
+- `IVFFLAT` on `embedding` (cosine) for ANN  
+- btree on symbol fields and GIN on JSONB `imports`/`calls`  
 
 ---
 
 ## Retrieval Strategy (Hybrid)
 
-- **Vector**: cosine similarity on pgvector (query embedded via Ollama)
-- **Lexical**: `ts_rank_cd` over a `simple` + `unaccent` tsvector of code text
-- **Symbol boost**: direct hits on `symbol_name` or `symbol_signature`
-- **Ordering**: `hybrid_score = w_vec*vec + w_lex*lex + w_sym*sym_boost`
+- **Vector**: cosine similarity on pgvector (query embedded via Ollama)  
+- **Lexical**: `ts_rank_cd` over a `simple` + `unaccent` tsvector of code text  
+- **Symbol boost**: direct hits on `symbol_name` or `symbol_signature`  
+- **Ordering**: `hybrid_score = w_vec*vec + w_lex*lex + w_sym*sym_boost`  
 
 Tuning knobs are exposed via query params (`w_vec`, `w_lex`, `w_sym`, `top_k`).
 
@@ -342,36 +324,35 @@ Tuning knobs are exposed via query params (`w_vec`, `w_lex`, `w_sym`, `top_k`).
 
 Current schema assumes **1024-dim** (`mxbai-embed-large`). To switch:
 
-1) Choose a new Ollama embedding model (e.g., `nomic-embed-text` at 768-dim).  
-2) Update env:
-   ```
+1. Choose a new Ollama embedding model (e.g., `nomic-embed-text` at 768-dim).  
+2. Update `.env`:
+   ```env
    EMB_MODEL=nomic-embed-text
    EMB_DIM=768
    ```
-3) Adjust DB column (dev workflow):
+3. Adjust DB schema:
    ```sql
-   -- Empty the table if re-ingesting from scratch:
+   -- Clear data if re-ingesting:
    TRUNCATE rag.code_chunks;
    DROP INDEX IF EXISTS code_chunks_embedding_ivfflat;
    ALTER TABLE rag.code_chunks ALTER COLUMN embedding TYPE vector(768);
-   -- Recreate ANN index with the same or tuned params:
    CREATE INDEX code_chunks_embedding_ivfflat
      ON rag.code_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
    ANALYZE rag.code_chunks;
    ```
-4) Re-ingest.
+4. Re-ingest repositories.  
 
-> If you want to keep existing data, you’ll need to recompute embeddings to the new size.
+If you want to preserve data, you must recompute embeddings to the new dimension.
 
 ---
 
 ## Production Hardening
 
-- Put **auth** (API keys/JWT) in front of `/search` and `/ask/*`
-- Use **read-only DB roles** for the API
-- Enable **SSL** for Postgres (or run inside a trusted network)
-- Add **webhook/cron ingestion**, **idempotent staging**, **soft-deletes**, and **partitioning** for very large repos
-- Consider **HNSW** indexes if your pgvector build supports it (great online insert performance)
+- Put **auth** (API keys/JWT) in front of `/search` and `/ask/*`  
+- Use **read-only DB roles** for the API  
+- Enable **SSL** for Postgres (or run inside a trusted network)  
+- Add **webhook/cron ingestion**, **idempotent staging**, **soft-deletes**, and **partitioning** for very large repos  
+- Consider **HNSW** indexes if your pgvector build supports it (great online insert performance)  
 
 ---
 
@@ -427,19 +408,14 @@ docker exec -it ollama ollama pull mxbai-embed-large
 docker exec -it ollama ollama pull llama3.1:8b
 
 # Ingest repos
-REPO_URLS="https://github.com/expressjs/express.git" \
-docker compose --profile ingest up --exit-code-from ingest ingest
+REPO_URLS="https://github.com/expressjs/express.git" docker compose --profile ingest up --exit-code-from ingest ingest
 
 # Test search
 curl "http://localhost:8000/search?q=jwt%20verification&language=java"
 
 # Test Strands Agent
-curl -X POST http://localhost:8000/ask/strands \
-  -H "Content-Type: application/json" \
-  -d '{"question":"Where is JWT verification implemented?"}'
+curl -X POST http://localhost:8000/ask/strands   -H "Content-Type: application/json"   -d '{"question":"Where is JWT verification implemented?"}'
 
 # Test LangGraph Agent
-curl -X POST http://localhost:8000/ask/langgraph \
-  -H "Content-Type: application/json" \
-  -d '{"question":"Where is JWT verification implemented?"}'
+curl -X POST http://localhost:8000/ask/langgraph   -H "Content-Type: application/json"   -d '{"question":"Where is JWT verification implemented?"}'
 ```
