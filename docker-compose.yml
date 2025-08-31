@@ -36,7 +36,7 @@ services:
       - ollama:/root/.ollama
     # Use the API for healthcheck; more robust than CLI-only
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/version >/dev/null"]
+      test: ["CMD", "ollama", "list"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -104,6 +104,9 @@ services:
       STRANDS_TEMPERATURE: ${STRANDS_TEMPERATURE:-0.2}
       STRANDS_MAX_TOKENS: ${STRANDS_MAX_TOKENS:-2048}
 
+      #Tree splitter file
+      TS_LANG_SO: /opt/ts/my-languages.so
+
       # --- Simple app-side rate limits for Strands agent ---
       RL_MAX_CONCURRENCY: ${RL_MAX_CONCURRENCY:-2}
       RL_RPM: ${RL_RPM:-60}
@@ -137,12 +140,15 @@ services:
     environment:
       DB_DSN: ${DB_DSN:-postgresql://rag:ragpwd@pg:5432/ragdb}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
       EMB_MODEL: ${EMB_MODEL:-mxbai-embed-large:latest}
+      TS_LANG_SO: /opt/ts/my-languages.so
       EMB_DIM: "${EMB_DIM:-1024}"
       REPO_URLS: ${REPO_URLS:-}
     volumes:
       - .:/workspace
-    command: sh -lc "python /workspace/app/ingest.py"
+      - repos:/workspace/repos
+    command: bash "/workspace/scripts/ingest_entrypoint.sh"
     profiles: ["ingest"]
 
   # ---- Admin utilities (DANGER) ----
@@ -184,3 +190,4 @@ services:
 volumes:
   pgdata: {}
   ollama: {}
+  repos: {}

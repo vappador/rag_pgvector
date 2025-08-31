@@ -190,8 +190,13 @@ The stack is defined in `docker-compose.yml` with additional one-shot services a
 
 ```bash
 docker compose up -d pg ollama
-docker compose --profile init up migrate
+#To bring down all the services
+docker compose down pg ollama app
+docker compose --profile init run --rm migrate
+docker compose build app 
 docker compose up -d app
+docker compose exec pg psql -U rag -d postgres -c "DROP DATABASE ragdb;" (low tech db reset)
+docker compose exec pg psql -U rag -d postgres -c "CREATE DATABASE ragdb;" (run this before running migrate)
 ```
 
 ### 2) Pull models into Ollama
@@ -205,7 +210,7 @@ docker exec -it ollama ollama pull llama3.1:8b
 
 ```bash
 REPO_URLS="https://github.com/expressjs/express.git,https://github.com/spring-projects/spring-petclinic.git" \
-  docker compose --profile ingest up --exit-code-from ingest ingest
+  docker compose --profile ingest up --build --exit-code-from ingest ingest
 ```
 
 ### 4) Try the retrieval API
@@ -400,7 +405,25 @@ If you want to preserve data, you must recompute embeddings to the new dimension
   docker exec -it ollama ollama list
   docker exec -it ollama ollama pull mxbai-embed-large
   ```
+  
+- **How to check if the language.so file is properly created for ast chuncking**
+  ```bash
+  docker compose exec app ls -l /opt/ts/my-languages.so
+  docker compose exec app printenv TS_LANG_SO
+  docker compose exec -T app python - <<'PY'
+  import os
+  from tree_sitter import Language
+  p=os.environ.get("TS_LANG_SO"); print("TS_LANG_SO=", p)
+  for name in ["java","typescript","javascript","python"]:
+    try:
+        Language(p, name)
+        print("OK:", name)
+    except Exception as e:
+        print("FAIL:", name, e)
+  PY
 
+
+```
 - **Reranker model missing / slow**  
   Disable reranking temporarily or reduce `top_k`; confirm GPU/CPU availability if using a CE model.
 

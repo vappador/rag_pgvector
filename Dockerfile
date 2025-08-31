@@ -37,8 +37,39 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip && \
     pip install -r /workspace/app/requirements.txt
 
+# --- Build Tree-sitter bundle into NON-mounted path (/opt/ts) ---
+# Clone grammars (as you already do) ...
+RUN mkdir -p /opt/ts/vendor && \
+    git clone --depth 1 https://github.com/tree-sitter/tree-sitter-java /opt/ts/vendor/tree-sitter-java && \
+    git clone --depth 1 https://github.com/tree-sitter/tree-sitter-typescript /opt/ts/vendor/tree-sitter-typescript && \
+    git clone --depth 1 https://github.com/tree-sitter/tree-sitter-javascript /opt/ts/vendor/tree-sitter-javascript && \
+    git clone --depth 1 https://github.com/tree-sitter/tree-sitter-python /opt/ts/vendor/tree-sitter-python
+
+# Write the Python builder script using a heredoc
+RUN cat >/opt/ts/build_ts.py <<'PY'
+from tree_sitter import Language
+Language.build_library(
+    '/opt/ts/my-languages.so',
+    [
+        '/opt/ts/vendor/tree-sitter-java',
+        '/opt/ts/vendor/tree-sitter-typescript/typescript',
+        '/opt/ts/vendor/tree-sitter-typescript/tsx',
+        '/opt/ts/vendor/tree-sitter-javascript',
+        '/opt/ts/vendor/tree-sitter-python',
+    ],
+)
+print("Built /opt/ts/my-languages.so")
+PY
+
+# Run it, then clean up
+RUN python /opt/ts/build_ts.py && rm -f /opt/ts/build_ts.py && ls -l /opt/ts
+
 # App code
 COPY . /workspace
+
+# Add ingest entrypoint script
+COPY scripts/ingest_entrypoint.sh /workspace/scripts/ingest_entrypoint.sh
+RUN chmod +x /workspace/scripts/ingest_entrypoint.sh
 
 # Non-root
 RUN useradd -ms /bin/bash appuser && chown -R appuser:appuser /workspace
@@ -46,3 +77,4 @@ USER appuser
 
 # Serve unified API (Strands + LangGraph demos + graph endpoints)
 CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
+

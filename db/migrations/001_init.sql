@@ -1,4 +1,4 @@
--- 001_init.sql
+-- 001_init.sql (fixed)
 -- Fresh schema for code-focused RAG on Postgres + pgvector
 -- Safe to run on a brand-new database.
 
@@ -10,18 +10,11 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;          -- optional, helpful for fuzzy text
 CREATE EXTENSION IF NOT EXISTS btree_gin;        -- optional, for mixed GIN use
 
--- Optional: declare a domain so changing embedding dimension is one-line
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_type t
-    JOIN pg_namespace n ON n.oid = t.typnamespace
-    WHERE t.typname = 'embedding_vec' AND n.nspname = 'public'
-  ) THEN
-    -- Default to 1024 dims (Ollama mxbai-embed-large). Change here if you switch models.
-    EXECUTE 'CREATE DOMAIN embedding_vec AS vector(1024)';
-  END IF;
-END$$;
+-- NOTE:
+-- Avoid using a DOMAIN over vector() for the embedding column, since
+-- pgvector indexes (IVFFlat/HNSW) require the column to have a fixed
+-- dimension on the base type itself. We declare vector(1024) directly.
+-- If you switch embedding models, change 1024 accordingly and rebuild.
 
 -- Tables ----------------------------------------------------------------------
 
@@ -72,8 +65,8 @@ CREATE TABLE IF NOT EXISTS code_chunks (
   calls           TEXT[] NOT NULL DEFAULT '{}',
   ast             JSONB,
 
-  -- Embeddings
-  embedding       embedding_vec,                  -- vector(n); n defined by domain above
+  -- Embeddings (fixed dim; match your embedding model, default 1024 for mxbai-embed-large)
+  embedding       VECTOR(1024),
   embedding_model TEXT,                           -- e.g., "mxbai-embed-large"
   embedding_hash  TEXT,                           -- hash of embedding input to avoid re-embed
   content_hash    TEXT,                           -- hash of chunk content for idempotence
@@ -91,6 +84,7 @@ CREATE TABLE IF NOT EXISTS chunk_edges (
   src_chunk_id  BIGINT NOT NULL REFERENCES code_chunks(id) ON DELETE CASCADE,
   dst_chunk_id  BIGINT NOT NULL REFERENCES code_chunks(id) ON DELETE CASCADE,
   edge_type     TEXT   NOT NULL CHECK (edge_type IN ('calls','imports','references')),
+  weight        REAL   NOT NULL DEFAULT 1.0,                -- <— added
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (src_chunk_id, dst_chunk_id, edge_type)
 );
@@ -100,8 +94,7 @@ CREATE TABLE IF NOT EXISTS chunk_edges (
 -- Keep content_tsv in sync with content
 CREATE OR REPLACE FUNCTION trg_update_content_tsv() RETURNS trigger AS $$
 BEGIN
-  NEW.content_tsv :=
-    to_tsvector('english', coalesce(NEW.content,''));
+  NEW.content_tsv := to_tsvector('english', coalesce(NEW.content,''));
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -149,8 +142,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_calls_gin     ON code_chunks USING GIN (ca
 CREATE INDEX IF NOT EXISTS idx_chunks_ast_gin       ON code_chunks USING GIN (ast jsonb_path_ops);
 
 -- Vector index (choose one — IVFFLAT is broadly available)
--- Note: IVFFLAT requires setting `SET enable_seqscan = off;` during benchmarking,
--- and you should ANALYZE after bulk loads. Tune `lists` per dataset size.
+-- NOTE: Requires fixed-dimension vector columns (e.g., VECTOR(1024)).
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding_ivf ON code_chunks
 USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
 
@@ -184,4 +176,7 @@ COMMIT;
 -- Post-load tips:
 -- * Run ANALYZE after bulk ingest:   VACUUM (ANALYZE, VERBOSE) code_chunks;
 -- * For IVFFLAT, also set probes at query time: SET ivfflat.probes = 10;
--- * If you change embedding dims, ALTER the domain: DROP DOMAIN embedding_vec; CREATE DOMAIN embedding_vec AS vector(<new_dim>); then ALTER TABLE code_chunks ALTER COLUMN embedding TYPE embedding_vec;
+-- * If you change embedding dims, you must ALTER the column and rebuild indexes:
+--     ALTER TABLE code_chunks ALTER COLUMN embedding TYPE vector(<new_dim>);
+--     DROP INDEX IF EXISTS idx_chunks_embedding_ivf;
+--     CREATE INDEX idx_chunks_embedding_ivf ON code_chunks USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
