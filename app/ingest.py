@@ -10,7 +10,7 @@ What this version does:
   - Intra-file call edges after chunk upserts.
   - Cross-file call edges via a DB stored procedure (build_cross_file_call_edges).
 - New metadata & indices to improve cross-file resolution:
-  - code_files.module, code_chunks.symbol_simple
+  - code_files.module, code_chunks.symbol_simple, code_chunks.symbol_signature
   - file_imports (normalized import surface)
   - code_symbols (export/definition surface)
 - Flags:
@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Any
@@ -48,34 +49,72 @@ log = logging.getLogger("ingest")
 
 # ------------------------------ Optional deps ---------------------------------
 
-# Tree-sitter (optional)
+# Tree-sitter (optional) with robust fallback:
+# 1) Try loading your compiled my-languages.so (TS_LANG_SO / build/my-languages.so)
+# 2) If incompatible (e.g., "Language version 15" vs runtime 13-14), fall back to
+#    prebuilt grammars from `tree_sitter_languages`.
 TS_AVAILABLE = False
 PARSER_BY_LANG: Dict[str, "Parser"] = {}
 LANG_SO_DEFAULT = str(Path("build") / "my-languages.so")
 TS_LANG_SO = os.environ.get("TS_LANG_SO", LANG_SO_DEFAULT)
 
-try:
-    from tree_sitter import Language, Parser  # type: ignore
+def _load_ts_parsers() -> Dict[str, "Parser"]:
+    parsers: Dict[str, "Parser"] = {}
+    try:
+        from tree_sitter import Language, Parser  # type: ignore
+    except Exception as e:
+        log.info(f"Tree-sitter unavailable; using fallback chunking. Reason: {e}")
+        return parsers
 
-    if Path(TS_LANG_SO).exists():
-        _LANGS = {}
-        for lang_name in ("java", "typescript", "javascript", "python"):
-            try:
-                _LANGS[lang_name] = Language(TS_LANG_SO, lang_name)
-            except Exception as e:
-                log.debug(f"Tree-sitter: skipping '{lang_name}': {e}")
-        for name, ts_lang in _LANGS.items():
+    # 1) Try custom shared object first (if present)
+    so_path = Path(TS_LANG_SO) if TS_LANG_SO else None
+    tried_custom = False
+    if so_path and so_path.exists():
+        tried_custom = True
+        try:
+            langs = ("java", "typescript", "javascript", "python")
+            for name in langs:
+                ts_lang = Language(str(so_path), name)
+                p = Parser()
+                p.set_language(ts_lang)
+                parsers[name] = p
+            log.info(f"Tree-sitter enabled via {so_path} for: {', '.join(parsers.keys())}")
+            return parsers
+        except Exception as e:
+            # Typical error: "Incompatible Language version 15. Must be between 13 and 14"
+            log.warning(
+                f"Failed to load {so_path} ({e}). Falling back to prebuilt grammars."
+            )
+
+    # 2) Fallback to prebuilt grammars that match the installed python binding
+    try:
+        from tree_sitter import Parser  # re-import safe
+        from tree_sitter_languages import get_language  # type: ignore
+
+        mapping = {
+            "java": "java",
+            "typescript": "typescript",
+            "javascript": "javascript",
+            "python": "python",
+        }
+        for name, lang_id in mapping.items():
+            ts_lang = get_language(lang_id)
             p = Parser()
             p.set_language(ts_lang)
-            PARSER_BY_LANG[name] = p
-        TS_AVAILABLE = len(PARSER_BY_LANG) > 0
-        if TS_AVAILABLE:
-            log.info(f"Tree-sitter enabled for: {', '.join(PARSER_BY_LANG.keys())}")
-    else:
-        log.info("Tree-sitter bundle not found; using fallback chunking.")
-except Exception as e:
-    log.info(f"Tree-sitter unavailable; using fallback chunking. Reason: {e}")
-    TS_AVAILABLE = False
+            parsers[name] = p
+
+        log.info(f"Tree-sitter prebuilt grammars enabled for: {', '.join(parsers.keys())}")
+        return parsers
+    except Exception as e:
+        # If we tried the custom .so and prebuilt also failed, report the reason
+        reason = f"custom={tried_custom}, error={e}"
+        log.info(f"Tree-sitter unavailable; using fallback chunking. Reason: {reason}")
+        return {}
+
+# initialize
+PARSER_BY_LANG = _load_ts_parsers()
+TS_AVAILABLE = len(PARSER_BY_LANG) > 0
+
 
 # Ollama (optional, only used when --embed)
 OLLAMA_AVAILABLE = False
@@ -151,6 +190,7 @@ class Chunk:
     language: str
     symbol_kind: str          # class|method|function|module|module_part
     symbol_name: str          # e.g., Person#updateEmail or FQN for Java
+    symbol_signature: Optional[str]  # e.g., Person#updateEmail(email: str)
     start_line: int
     end_line: int
     content: str
@@ -168,6 +208,36 @@ def _walk(node) -> Iterable:
         yield n
         for i in reversed(range(n.child_count)):
             stack.append(n.child(i))
+
+# ------------ Signature helpers (language-agnostic, header-based) ------------
+
+_WS_RE = re.compile(r"\s+")
+
+def _extract_params_from_header(body: str) -> str:
+    """
+    Heuristic: take text up to the first block/colon, then grab first (...) group.
+    Works for Java/TS/JS (stops at '{') and Python (stops at ':').
+    Falls back to empty string if none found.
+    """
+    if not body:
+        return ""
+    header = body
+    for stop in ("{", ":\n", ":\r", ":\r\n", ":\t", ":\f", ":\v", ": "):
+        if stop in header:
+            header = header.split(stop, 1)[0]
+            break
+    m = re.search(r"\((.*?)\)", header, flags=re.S)
+    if not m:
+        return ""
+    # normalize whitespace inside params
+    params = _WS_RE.sub(" ", m.group(1).strip())
+    # trim trailing commas etc.
+    params = params.strip().strip(",")
+    return params
+
+def _build_signature(symbol_name: str, content: str) -> str:
+    params = _extract_params_from_header(content)
+    return f"{symbol_name}({params})" if params else f"{symbol_name}()"
 
 # -------- Enhanced call extraction helpers --------
 
@@ -296,6 +366,7 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                         end_line = n.end_point[0] + 1
                         content = _node_text(source, n)
                         fq_sym = f"{java_package}.{class_name}#{meth_name}" if java_package else f"{class_name}#{meth_name}"
+                        signature = _build_signature(fq_sym, content)
                         ast_meta = {"class": class_name, "method": meth_name}
                         if java_package:
                             ast_meta["package"] = java_package
@@ -304,6 +375,7 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                                 language=lang,
                                 symbol_kind="method",
                                 symbol_name=fq_sym,
+                                symbol_signature=signature,
                                 start_line=start_line,
                                 end_line=end_line,
                                 content=content,
@@ -344,12 +416,14 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                                 calls.add(nm)
                                 if "." in nm:
                                     calls.add(nm.split(".")[-1])
+                    signature = _build_signature(name, _node_text(source, n))
                     ast_meta = {"function": name, "exports": sorted(list(exports))}
                     chunks.append(
                         Chunk(
                             language=lang,
                             symbol_kind="function",
                             symbol_name=name,
+                            symbol_signature=signature,
                             start_line=n.start_point[0] + 1,
                             end_line=n.end_point[0] + 1,
                             content=_node_text(source, n),
@@ -386,12 +460,15 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                                     calls.add(nm)
                                     if "." in nm:
                                         calls.add(nm.split(".")[-1])
+                        sym_name = f"{class_name}#{meth_name}"
+                        signature = _build_signature(sym_name, _node_text(source, m))
                         ast_meta = {"class": class_name, "method": meth_name, "exports": sorted(list(exports))}
                         chunks.append(
                             Chunk(
                                 language=lang,
                                 symbol_kind="method",
-                                symbol_name=f"{class_name}#{meth_name}",
+                                symbol_name=sym_name,
+                                symbol_signature=signature,
                                 start_line=m.start_point[0] + 1,
                                 end_line=m.end_point[0] + 1,
                                 content=_node_text(source, m),
@@ -424,11 +501,13 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                                 calls.add(nm)
                                 if "." in nm:
                                     calls.add(nm.split(".")[-1])
+                    signature = _build_signature(name, _node_text(source, n))
                     chunks.append(
                         Chunk(
                             language=lang,
                             symbol_kind="function",
                             symbol_name=name,
+                            symbol_signature=signature,
                             start_line=n.start_point[0] + 1,
                             end_line=n.end_point[0] + 1,
                             content=_node_text(source, n),
@@ -465,11 +544,14 @@ def chunk_file_ast(path: Path, lang: str) -> List[Chunk]:
                                     calls.add(nm)
                                     if "." in nm:
                                         calls.add(nm.split(".")[-1])
+                        sym_name = f"{class_name}#{meth_name}"
+                        signature = _build_signature(sym_name, _node_text(source, m))
                         chunks.append(
                             Chunk(
                                 language=lang,
                                 symbol_kind="method",
-                                symbol_name=f"{class_name}#{meth_name}",
+                                symbol_name=sym_name,
+                                symbol_signature=signature,
                                 start_line=m.start_point[0] + 1,
                                 end_line=m.end_point[0] + 1,
                                 content=_node_text(source, m),
@@ -508,6 +590,7 @@ def chunk_file_fallback(path: Path, lang: str, max_chars: int, overlap_chars: in
                 language=lang or "unknown",
                 symbol_kind="module",
                 symbol_name=path.name,
+                symbol_signature=f"{path.name}()",
                 start_line=1,
                 end_line=len(lines),
                 content=seg,
@@ -528,6 +611,7 @@ def chunk_file_fallback(path: Path, lang: str, max_chars: int, overlap_chars: in
                 language=lang or "unknown",
                 symbol_kind="module_part",
                 symbol_name=f"{path.name}#part{idx}",
+                symbol_signature=f"{path.name}#part{idx}()",
                 start_line=1,
                 end_line=len(seg_lines),
                 content=seg,
@@ -655,12 +739,12 @@ def upsert_code_chunk(cur, file_id: int, c: Chunk, embed: bool, embed_model: Opt
         """
         INSERT INTO code_chunks
           (file_id, start_line, end_line, content, content_tsv,
-           language, symbol_kind, symbol_name, symbol_simple,
+           language, symbol_kind, symbol_name, symbol_simple, symbol_signature,
            imports, calls, ast,
            embedding, embedding_model, embedding_hash, content_hash)
         VALUES
-          (%s, %s, %s, %s, to_tsvector('english', %s),
-           %s, %s, %s, %s,
+          (%s, %s, %s, %s, to_tsvector('simple', unaccent(%s)),
+           %s, %s, %s, %s, %s,
            %s, %s, %s,
            %s, %s, %s, %s)
         ON CONFLICT (file_id, start_line, end_line) DO UPDATE SET
@@ -670,6 +754,7 @@ def upsert_code_chunk(cur, file_id: int, c: Chunk, embed: bool, embed_model: Opt
            symbol_kind = EXCLUDED.symbol_kind,
            symbol_name = EXCLUDED.symbol_name,
            symbol_simple = EXCLUDED.symbol_simple,
+           symbol_signature = EXCLUDED.symbol_signature,
            imports = EXCLUDED.imports,
            calls = EXCLUDED.calls,
            ast = EXCLUDED.ast,
@@ -690,6 +775,7 @@ def upsert_code_chunk(cur, file_id: int, c: Chunk, embed: bool, embed_model: Opt
             c.symbol_kind,
             c.symbol_name,
             symbol_simple,
+            (c.symbol_signature or f"{c.symbol_name}()"),
             c.imports,
             c.calls,
             psycopg2.extras.Json(c.ast),

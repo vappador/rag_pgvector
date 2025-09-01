@@ -8,6 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS btree_gin;
+CREATE EXTENSION IF NOT EXISTS unaccent;
 
 -- Tables ----------------------------------------------------------------------
 
@@ -72,6 +73,21 @@ CREATE TABLE IF NOT EXISTS code_chunks (
   UNIQUE (file_id, start_line, end_line)
 );
 
+ALTER TABLE code_chunks
+  ADD COLUMN IF NOT EXISTS symbol_signature TEXT;
+
+-- (Optional) seed it
+UPDATE code_chunks
+SET symbol_signature = symbol_name
+WHERE symbol_signature IS NULL;
+
+-- (Optional) index
+CREATE INDEX IF NOT EXISTS idx_chunks_symbol_signature
+  ON code_chunks(symbol_signature);
+
+-- Then your view can use c.symbol_signature directly (no NULL stub).
+
+
 -- Graph edges between chunks (code-aware navigation)
 CREATE TABLE IF NOT EXISTS chunk_edges (
   id            BIGSERIAL PRIMARY KEY,
@@ -114,7 +130,7 @@ CREATE TABLE IF NOT EXISTS code_symbols (
 -- Keep content_tsv in sync with content (also set directly by ingest)
 CREATE OR REPLACE FUNCTION trg_update_content_tsv() RETURNS trigger AS $$
 BEGIN
-  NEW.content_tsv := to_tsvector('english', coalesce(NEW.content,''));
+  NEW.content_tsv := to_tsvector('simple', unaccent(coalesce(NEW.content,'')));
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -182,6 +198,24 @@ CREATE INDEX IF NOT EXISTS idx_code_symbols_ss       ON code_symbols (symbol_sim
 CREATE INDEX IF NOT EXISTS idx_code_symbols_exported ON code_symbols (exported);
 
 -- Views -----------------------------------------------------------------------
+-- Public search view used by the retriever
+CREATE OR REPLACE VIEW v_chunk_search AS
+SELECT
+  c.id AS chunk_id,
+  r.name AS repo_name,
+  f.path,
+  f.language,
+  c.symbol_name,
+  c.symbol_kind,
+  c.symbol_signature,
+  c.start_line,
+  c.end_line,
+  c.content,
+  c.embedding,
+  c.content_tsv
+FROM code_chunks AS c
+JOIN code_files  AS f ON f.id = c.file_id
+JOIN repositories AS r ON r.id = f.repository_id;
 
 -- Handy view for provenance strings like repo:path:start-end
 CREATE OR REPLACE VIEW v_chunk_citation AS
