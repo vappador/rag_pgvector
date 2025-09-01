@@ -31,9 +31,9 @@ import psycopg2.extras
 import requests
 
 from strands import Agent
-from strands.models import OllamaModel
+from strands.models.ollama import OllamaModel
 from strands.tools import tool
-from strands.observability import get_metrics
+
 
 # Optional: auto-load .env when running locally (already handled by docker-compose)
 try:
@@ -98,8 +98,8 @@ def _norm_model(s: str) -> str:
 # --------------------------- Model & Tool -------------------------------------
 
 ollama_model = OllamaModel(
-    model_name=_norm_model(LLM_MODEL),
-    base_url=OLLAMA_BASE,
+    host=OLLAMA_BASE,
+    model_id=_norm_model(LLM_MODEL),
     temperature=TEMPERATURE,
     max_tokens=MAX_TOKENS,
 )
@@ -191,7 +191,6 @@ agent = Agent(
     model=ollama_model,
     tools=[retrieve_context],
     system_prompt=SYS,
-    stream=False,
 )
 
 # ------------------------- Simple Rate Limiter --------------------------------
@@ -232,7 +231,10 @@ def run_with_rate_limits(prompt: str) -> str:
         with span("Agent.run"):
             result = agent(prompt)
     metrics = get_metrics()
-    usage = getattr(metrics, "get_last_usage", lambda: None)()
+    usage = getattr(result.metrics, "accumulated_usage", None) or {}
     if usage:
-        log.info(f"[run={RUN_ID}] [metrics] input_tokens={usage.input_tokens} output_tokens={usage.output_tokens} total={usage.total_tokens}")
+        log.info(
+                f"[run={RUN_ID}] [metrics] input_tokens={usage.get('inputTokens')} "
+                f"output_tokens={usage.get('outputTokens')} total={usage.get('totalTokens')}"
+            )
     return result.text if hasattr(result, "text") else str(result)
