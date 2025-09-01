@@ -230,8 +230,8 @@ def run_with_rate_limits(prompt: str) -> str:
     with _concurrency:
         with span("Agent.run"):
             result = agent(prompt)
-    metrics = get_metrics()
-    usage = getattr(result.metrics, "accumulated_usage", None) or {}
+    # Strands SDK v1.6+: metrics are on the AgentResult
+    usage = getattr(getattr(result, "metrics", None), "accumulated_usage", None) or {}
     if usage:
         log.info(
                 f"[run={RUN_ID}] [metrics] input_tokens={usage.get('inputTokens')} "

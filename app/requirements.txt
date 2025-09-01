@@ -19,7 +19,7 @@ langgraph==0.2.35
 ollama>=0.2.0
 
 # --- Add Strands stack ---
-strands-agents[ollama]==1.6.0
+strands-agents[ollama,otel]==1.6.0
 strands-agents-tools>=0.1.0
 
 

@@ -216,7 +216,7 @@ REPO_URLS="https://github.com/expressjs/express.git,https://github.com/spring-pr
 ### 4) Try the retrieval API
 
 ```bash
-curl "http://localhost:8000/search?q=jwt%20verification&language=java"
+curl "http://localhost:8000/search?q=jwt%20verification&code_language=java"
 ```
 
 ### 5) Run the agents

@@ -13,6 +13,9 @@ import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel
+
 
 # ------------------------------ Logging ---------------------------------------
 
@@ -517,3 +520,59 @@ def search_endpoint(
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+class AskBody(BaseModel):
+    question: str
+
+# ----- Strands -----
+try:
+    import inspect, anyio
+    from app.strands_agent import run_with_rate_limits as run_strands
+    STRANDS_OK, STRANDS_ERR = True, None
+except Exception as e:
+    STRANDS_OK, STRANDS_ERR = False, e
+
+@app.post("/ask/strands")
+async def ask_strands(body: AskBody):
+    if not STRANDS_OK:
+        raise HTTPException(status_code=503, detail=f"Strands disabled: {STRANDS_ERR}")
+    # If run_strands is async, await it; if sync, run it on a thread.
+    if inspect.iscoroutinefunction(run_strands):
+        ans = await run_strands(body.question)
+    else:
+    # Run sync function without blocking the event loop
+        ans = await run_in_threadpool(run_strands, body.question)
+    return {"engine": "strands", "answer": ans}
+
+# ----- LangGraph -----
+try:
+    from app.agent_graph import ask_once as run_langgraph
+    LG_OK, LG_ERR = True, None
+except Exception as e:
+    LG_OK, LG_ERR = False, e
+
+@app.post("/ask/langgraph")
+async def ask_langgraph(body: AskBody):
+    if not LG_OK:
+        raise HTTPException(status_code=503, detail=f"LangGraph disabled: {LG_ERR}")
+    return {"engine": "langgraph", "answer": run_langgraph(body.question)}
+
+# ----- Graph endpoints -----
+try:
+    from app.search import graph_relations, graph_impact
+    G_OK, G_ERR = True, None
+except Exception as e:
+    G_OK, G_ERR = False, e
+
+@app.get("/graph/relations")
+def graph_rel(repo: str, file: str, direction: str = "both", depth: int = 2):
+    if not G_OK:
+        raise HTTPException(status_code=503, detail=f"Graph disabled: {G_ERR}")
+    return graph_relations(repo, file, direction, depth)
+
+@app.get("/graph/impact")
+def graph_imp(repo: str, file: str, depth: int = 2):
+    if not G_OK:
+        raise HTTPException(status_code=503, detail=f"Graph disabled: {G_ERR}")
+    return graph_impact(repo, file, depth)
+
