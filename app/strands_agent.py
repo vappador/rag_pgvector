@@ -1,3 +1,4 @@
+# app/strands_agent.py
 """
 Strands RAG agent (Postgres + pgvector) with Ollama, logging, and rate limiting.
 
@@ -9,20 +10,29 @@ Env:
 - STRANDS_TEMPERATURE: default 0.2
 - STRANDS_MAX_TOKENS: default 2048
 - RL_MAX_CONCURRENCY / RL_RPM / RL_TPM: local rate-limit knobs
+
+Logging / Observability:
 - LOG_LEVEL: INFO (default), DEBUG etc.
 - LOG_PROMPTS: 1/0 — log system/user/answer previews + injection warnings
 - LOG_OLLAMA_HTTP: 1/0 — log HTTP requests/responses to Ollama
 - LOG_BODY_PREVIEW: int — max chars of bodies to log (default 1200)
 - LOG_HEADERS: 1/0 — log HTTP headers (auth redacted)
-- FORCE_PRE_RETRIEVE: 1/0 — if 1, always fetch DB context and inject into the prompt before calling the LLM
+- LOG_FORMAT=pretty|json — pretty emoji console vs JSON lines (see app/obs.py)
+- LOG_COLOR=1|0 — ANSI color (pretty mode)
+- LOG_PREVIEW_CHARS — preview truncation (default 240)
+
+Retrieval knobs:
+- FORCE_PRE_RETRIEVE: 1/0 — if 1, always fetch DB context and inject into the prompt before LLM
 - PRE_RETRIEVE_TOPK: int — how many chunks to fetch when FORCE_PRE_RETRIEVE=1 (default 12)
 - CONTEXT_MAX_CHARS: int — cap injected context length (default 24000)
-- CONTEXT_HEADER / CONTEXT_FOOTER: optional strings wrapped around the injected context
+- CONTEXT_HEADER / CONTEXT_FOOTER: optional strings wrapped around injected context
 
-This module exposes:
+Exports:
 - run_with_rate_limits(prompt: str) -> str
-- retrieve_context(question: str, top_k: int = 12) -> str (tool)
+- retrieve_context(question: str, top_k: int = 12) -> str   (Strands tool)
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -31,7 +41,6 @@ import uuid
 import json
 import logging
 import threading
-from contextlib import contextmanager
 from typing import List, Dict, Any, Tuple
 import re
 
@@ -43,10 +52,13 @@ from strands import Agent
 from strands.models.ollama import OllamaModel
 from strands.tools import tool
 
+# Local observability
+from app import obs
+
 # Optional: auto-load .env when running locally (already handled by docker-compose)
 try:
     from dotenv import load_dotenv  # python-dotenv
-    load_dotenv()  # loads variables from a .env file into os.environ if present
+    load_dotenv()
 except Exception:
     pass
 
@@ -61,6 +73,7 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("strands-agent")
+
 RUN_ID = os.getenv("RUN_ID", uuid.uuid4().hex[:8])
 LOG_PREVIEW_CHARS = int(os.getenv("LOG_PREVIEW_CHARS", "240"))
 LOG_PROMPTS = os.getenv("LOG_PROMPTS", "1").lower() in ("1", "true", "yes")
@@ -74,17 +87,6 @@ def preview(txt: str, limit: int = LOG_PREVIEW_CHARS) -> str:
         return ""
     txt = str(txt).replace("\n", "\\n")
     return txt if len(txt) <= limit else txt[:limit] + f"... (+{len(txt)-limit} more)"
-
-
-@contextmanager
-def span(name: str):
-    t0 = time.perf_counter()
-    log.info(f"[run={RUN_ID}] ▶ {name} …")
-    try:
-        yield
-    finally:
-        dt = time.perf_counter() - t0
-        log.info(f"[run={RUN_ID}] ✔ {name} done in {dt:.3f}s")
 
 
 # ------------------------------ Security --------------------------------------
@@ -124,7 +126,7 @@ def _redact_headers(h: Dict[str, str]) -> Dict[str, str]:
 
 
 def install_ollama_http_logger(base_url: str):
-    """Monkey-patch requests to log all calls to OLLAMA_BASE (request+response)."""
+    """Monkey-patch requests to log all calls to OLLAMA_BASE (request+response), and forward to obs."""
     if not LOG_OLLAMA_HTTP:
         return
     base = (base_url or "").rstrip("/")
@@ -158,6 +160,8 @@ def install_ollama_http_logger(base_url: str):
                 except Exception:
                     text_preview = "<non-text response>"
                 log.info(f"[run={RUN_ID}] [HTTP←OLLAMA] {resp.status_code} in {dt:.1f}ms body={preview(text_preview, LOG_BODY_PREVIEW)}")
+                # Forward to obs for pretty/JSON logs
+                obs.log_http(url=url, method=method, status=resp.status_code, duration_ms=int(dt), body_preview=text_preview)
             return resp
         except Exception as e:
             if url.startswith(base):
@@ -213,7 +217,7 @@ def _retrieve_context_impl(question: str, top_k: int = 12) -> str:
         log.info(f"[run={RUN_ID}] [embedding] model={_norm_model(EMB_MODEL)} question_len={len(question)} preview=\"{preview(question)}\"")
 
     emb_url = OLLAMA_BASE.rstrip("/") + "/api/embeddings"
-    with span("Embedding query"):
+    with obs.span("Embedding query"):
         payload = {"model": _norm_model(EMB_MODEL), "prompt": question}
         log.debug(f"[run={RUN_ID}] [embedding] POST {emb_url} json_keys={list(payload.keys())}")
         r = requests.post(emb_url, json=payload, timeout=30)
@@ -226,7 +230,7 @@ def _retrieve_context_impl(question: str, top_k: int = 12) -> str:
     q_emb_lit = as_vector_literal(q_emb)
 
     # --- DB search (try with unaccent; on error, rollback and retry without it) ---
-    with span("DB search (vector + lexical)"):
+    with obs.span("DB search (vector + lexical)"):
         with psycopg2.connect(DB_DSN) as conn:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cur.execute("SET LOCAL statement_timeout = '15000ms';")
@@ -240,12 +244,12 @@ def _retrieve_context_impl(question: str, top_k: int = 12) -> str:
                     ),
                     scored AS (
                       SELECT
-                        v.id, v.repo_name, v.path, v.language,
+                        v.chunk_id AS id, v.repo_name, v.path, v.language,
                         v.symbol_name, v.symbol_kind, v.symbol_signature,
                         v.start_line, v.end_line, v.content,
                         1 - (v.embedding <=> (SELECT emb FROM q)) AS vec_score,
                         ts_rank_cd(v.content_tsv, (SELECT tsq FROM q)) AS lex_score
-                      FROM rag.v_chunk_search v
+                      FROM v_chunk_search v
                       WHERE ( (SELECT tsq FROM q) @@ v.content_tsv OR (SELECT emb FROM q) IS NOT NULL )
                     )
                     SELECT *, (0.7*vec_score + 0.3*lex_score) AS s
@@ -253,11 +257,15 @@ def _retrieve_context_impl(question: str, top_k: int = 12) -> str:
                     ORDER BY s DESC
                     LIMIT {int(top_k)};
                 """
+                t0 = time.perf_counter()
                 cur.execute(sql, (q_emb_lit, question, question))
-            except psycopg2.Error as e:
-                # Most likely unaccent() missing. Roll back and retry without it.
+                dt_ms = int((time.perf_counter() - t0) * 1000)
+                rows = cur.fetchall()
+                obs.log_db(sql, duration_ms=dt_ms, rows=len(rows))
+            except psycopg2.errors.UndefinedFunction as e:
+                # Likely unaccent() not available. Roll back and retry without it.
                 used_unaccent = False
-                log.warning(f"[run={RUN_ID}] [db] unaccent path failed ({e.__class__.__name__}: {e}); rolling back and retrying without unaccent")
+                log.warning(f"[run={RUN_ID}] [db] unaccent() missing; retrying without it ({e})")
                 try:
                     conn.rollback()
                 except Exception:
@@ -276,12 +284,12 @@ def _retrieve_context_impl(question: str, top_k: int = 12) -> str:
                     ),
                     scored AS (
                       SELECT
-                        v.id, v.repo_name, v.path, v.language,
+                        v.chunk_id AS id, v.repo_name, v.path, v.language,
                         v.symbol_name, v.symbol_kind, v.symbol_signature,
                         v.start_line, v.end_line, v.content,
                         1 - (v.embedding <=> (SELECT emb FROM q)) AS vec_score,
                         ts_rank_cd(v.content_tsv, (SELECT tsq FROM q)) AS lex_score
-                      FROM rag.v_chunk_search v
+                      FROM v_chunk_search v
                       WHERE ( (SELECT tsq FROM q) @@ v.content_tsv OR (SELECT emb FROM q) IS NOT NULL )
                     )
                     SELECT *, (0.7*vec_score + 0.3*lex_score) AS s
@@ -289,9 +297,19 @@ def _retrieve_context_impl(question: str, top_k: int = 12) -> str:
                     ORDER BY s DESC
                     LIMIT {int(top_k)};
                 """
+                t0 = time.perf_counter()
                 cur.execute(sql, (q_emb_lit, question, question))
-
-            rows = cur.fetchall()
+                dt_ms = int((time.perf_counter() - t0) * 1000)
+                rows = cur.fetchall()
+                obs.log_db(sql, duration_ms=dt_ms, rows=len(rows))
+            except psycopg2.errors.UndefinedColumn as e:
+                # Surface real column errors immediately (e.g., selecting v.id from view exposing chunk_id)
+                log.error(f"[run={RUN_ID}] [db] column error: {e}")
+                raise
+            except psycopg2.Error as e:
+                # Generic DB error path (still log + re-raise)
+                log.error(f"[run={RUN_ID}] [db] unexpected error: {e}")
+                raise
 
             # Compact top-5 preview with safe float formatting
             def _fnum(x: Any) -> float:
@@ -320,11 +338,16 @@ def _retrieve_context_impl(question: str, top_k: int = 12) -> str:
     log.debug(f"[run={RUN_ID}] [retrieve_context_impl] stitched_len={len(stitched)}")
     return stitched
 
+
+# ------------------------------ Tool wrapper ----------------------------------
+
 @tool(name="retrieve_context", description="Retrieve top relevant code/context from Postgres RAG index for a natural-language question.")
+@obs.observe_tool("retrieve_context")
 def retrieve_context(question: str, top_k: int = 12) -> str:
-    # Tool wrapper around the shared implementation
     return _retrieve_context_impl(question, top_k)
 
+
+# ------------------------ Context augmentation --------------------------------
 
 def _augment_with_context(user_prompt: str, top_k: int) -> Tuple[str, str]:
     """Fetch context and inject into the prompt. Returns (augmented_prompt, context_used)."""
@@ -345,11 +368,16 @@ def _augment_with_context(user_prompt: str, top_k: int) -> Tuple[str, str]:
     return augmented, ctx
 
 
+# -------------------------------- System prompt --------------------------------
+
 SYS = (
     "You are a senior code assistant. Use the provided repository context strictly.\n"
     "Cite file/line provenance already included in the context comments. "
     "If context is insufficient, say so briefly."
 )
+
+
+# ------------------------------- Agent setup -----------------------------------
 
 # Install HTTP logger before any client calls
 install_ollama_http_logger(OLLAMA_BASE)
@@ -401,6 +429,8 @@ def _estimate_tokens(s: str) -> int:
     return max(1, len(s) // 4)
 
 
+# --------------------------------- Run loop ------------------------------------
+
 def run_with_rate_limits(prompt: str) -> str:
     # Pre-retrieve context if configured, so it's definitely present in the prompt.
     if FORCE_PRE_RETRIEVE:
@@ -422,9 +452,13 @@ def run_with_rate_limits(prompt: str) -> str:
             f"system_preview=\"{preview(SYS)}\" user_preview=\"{preview(user_for_model)}\""
         )
 
+    # Agent.run with concurrency guard + rich observability
     with _concurrency:
-        with span("Agent.run"):
+        obs.agent_start(SYS, user_for_model)
+        with obs.span("Agent.run"):
+            t0 = time.perf_counter()
             result = agent(user_for_model)
+            agent_ms = int((time.perf_counter() - t0) * 1000)
 
     # Strands SDK v1.6+: metrics are on the AgentResult
     usage = getattr(getattr(result, "metrics", None), "accumulated_usage", None) or {}
@@ -434,7 +468,20 @@ def run_with_rate_limits(prompt: str) -> str:
             f"output_tokens={usage.get('outputTokens')} total={usage.get('totalTokens')}"
         )
 
+    # "Behind Agent.run" probe
     out = result.text if hasattr(result, "text") else str(result)
+    obs.log_model_call(
+        model_id=_norm_model(LLM_MODEL),
+        prompt=user_for_model,
+        response_text=out,
+        tokens_in=usage.get("inputTokens") if usage else None,
+        tokens_out=usage.get("outputTokens") if usage else None,
+        duration_ms=None  # you can pass agent_ms here if desired
+    )
+
     if LOG_PROMPTS:
         log.info(f"[run={RUN_ID}] [agent→user] answer_len={len(out)} preview=\"{preview(out)}\"")
+
+    obs.agent_end(out, tokens_in=usage.get("inputTokens") if usage else None,
+                       tokens_out=usage.get("outputTokens") if usage else None)
     return out
