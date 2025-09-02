@@ -63,3 +63,6 @@ pnpm-debug.log*
 .AppleDouble
 .Spotlight-V100
 .Trashes
+/llama3.1-8b-usage.txt
+/find_llama.sh
+/debug/last_prompt.md
